@@ -7,30 +7,62 @@ from typing import Dict, List
 
 _ZERO_SHOT_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
-_LAST_BACKEND = "deterministic-adapter"
+_LAST_BACKEND = "pretrained-uninitialized"
 
 _ISSUE_LABELS = [
-    "blurry image",
-    "underexposed photo",
-    "overexposed photo",
+    "out of focus subject",
+    "motion blur",
+    "digital noise",
+    "underexposed scene",
+    "overexposed highlights",
     "low contrast scene",
+    "flat lighting",
+    "color cast issue",
     "oversaturated colors",
-    "dull colors",
-    "noisy image",
-    "cluttered composition",
-    "subject not well framed",
+    "desaturated colors",
+    "cluttered background",
+    "weak subject separation",
+    "crooked horizon",
+    "strong composition",
+    "balanced exposure",
+    "natural colors",
+    "good sharpness",
 ]
 
 _ISSUE_SUGGESTIONS = {
-    "blurry image": "Use a faster shutter speed or stabilize the camera to improve sharpness.",
-    "underexposed photo": "Raise exposure slightly or add controlled fill light to recover shadow detail.",
-    "overexposed photo": "Reduce highlights and lower exposure compensation to preserve bright-area detail.",
-    "low contrast scene": "Increase local contrast modestly to improve depth and subject separation.",
-    "oversaturated colors": "Reduce vibrance slightly to restore natural color balance.",
-    "dull colors": "Boost vibrance selectively to improve color separation without clipping.",
-    "noisy image": "Lower ISO where possible and apply targeted noise reduction in darker regions.",
-    "cluttered composition": "Simplify the frame by cropping distractions around the subject.",
-    "subject not well framed": "Recompose using rule-of-thirds placement to strengthen focus.",
+    "out of focus subject": "Refocus on the primary subject and use a faster shutter speed to improve clarity.",
+    "motion blur": "Increase shutter speed or stabilize the camera to reduce motion blur.",
+    "digital noise": "Lower ISO where possible and apply targeted noise reduction in darker regions.",
+    "underexposed scene": "Raise exposure slightly or add controlled fill light to recover shadow detail.",
+    "overexposed highlights": "Reduce highlights and exposure compensation to preserve bright-area detail.",
+    "low contrast scene": "Increase local contrast to improve depth and subject separation.",
+    "flat lighting": "Introduce directional lighting or local dodge/burn to add dimensionality.",
+    "color cast issue": "Adjust white balance and tint to neutralize the color cast.",
+    "oversaturated colors": "Reduce vibrance and saturation slightly to restore natural color balance.",
+    "desaturated colors": "Increase vibrance modestly to improve color separation without clipping.",
+    "cluttered background": "Simplify the frame by cropping distractions around the subject.",
+    "weak subject separation": "Create clearer subject isolation with contrast and depth separation.",
+    "crooked horizon": "Straighten the horizon to stabilize visual balance.",
+    "strong composition": "Composition is strong; refine micro-contrast and local detail for a final polish.",
+    "balanced exposure": "Exposure is well balanced; fine-tune highlights and shadows for texture depth.",
+    "natural colors": "Colors are natural; subtle selective grading can enhance mood while staying realistic.",
+    "good sharpness": "Sharpness is good; avoid over-sharpening and preserve fine texture detail.",
+}
+
+_NEGATIVE_ISSUES = {
+    "out of focus subject",
+    "motion blur",
+    "digital noise",
+    "underexposed scene",
+    "overexposed highlights",
+    "low contrast scene",
+    "flat lighting",
+    "color cast issue",
+    "oversaturated colors",
+    "desaturated colors",
+    "cluttered background",
+    "weak subject separation",
+    "crooked horizon",
 }
 
 
@@ -95,25 +127,6 @@ def _get_zero_shot_pipeline():
     return _ZERO_SHOT_PIPELINE
 
 
-def _fallback_suggestions(scores: Dict[str, float]) -> List[str]:
-    suggestions: List[str] = []
-
-    if float(scores.get("composition", 0.0)) < 6.0:
-        suggestions.append("Try reframing with the subject near a rule-of-thirds intersection for stronger balance.")
-    if float(scores.get("lighting", 0.0)) < 6.0:
-        suggestions.append("Adjust exposure and highlight control to recover more tonal detail.")
-    if float(scores.get("color", 0.0)) < 6.0:
-        suggestions.append("Tune white balance and vibrance to improve color harmony.")
-    if float(scores.get("technical", 0.0)) < 6.0:
-        suggestions.append("Improve sharpness with steadier support and a faster capture speed.")
-
-    if not suggestions:
-        suggestions.append("Strong image overall. Minor local contrast adjustments can add extra depth.")
-        suggestions.append("Consider a subtle crop to tighten focus on the primary subject.")
-
-    return suggestions[:3]
-
-
 def get_last_backend() -> str:
     return _LAST_BACKEND
 
@@ -124,20 +137,23 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
 
     classifier = _get_zero_shot_pipeline()
     if classifier is None:
-        _LAST_BACKEND = "deterministic-adapter"
-        return _fallback_suggestions(scores)
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained suggester pipeline could not be initialized")
 
     threshold = max(0.05, min(_env_float("PRETRAINED_SUGGESTER_THRESHOLD", 0.20), 0.95))
     top_k = max(2, min(_env_int("PRETRAINED_SUGGESTER_TOP_K", 3), 5))
 
     try:
         predictions = classifier(image, candidate_labels=_ISSUE_LABELS)
-    except Exception:
-        _LAST_BACKEND = "deterministic-adapter"
-        return _fallback_suggestions(scores)
+    except Exception as exc:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained suggester inference failed") from exc
 
     suggestions: List[str] = []
     seen = set()
+    fallback_labels: List[str] = []
+    top_label = ""
+    top_score = 0.0
 
     if isinstance(predictions, list):
         for entry in predictions[:top_k]:
@@ -149,7 +165,16 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
             except (TypeError, ValueError):
                 continue
 
+            if label:
+                fallback_labels.append(label)
+                if score > top_score:
+                    top_score = score
+                    top_label = label
+
             if score < threshold:
+                continue
+
+            if label not in _NEGATIVE_ISSUES:
                 continue
 
             suggestion = _ISSUE_SUGGESTIONS.get(label)
@@ -159,9 +184,20 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
             seen.add(suggestion)
             suggestions.append(suggestion)
 
-    if suggestions:
-        _LAST_BACKEND = "pretrained"
-        return suggestions[:3]
+    if not suggestions:
+        ordered_labels = [top_label] + fallback_labels if top_label else list(fallback_labels)
+        for label in ordered_labels:
+            suggestion = _ISSUE_SUGGESTIONS.get(label)
+            if not suggestion or suggestion in seen:
+                continue
+            seen.add(suggestion)
+            suggestions.append(suggestion)
+            if len(suggestions) >= 3:
+                break
 
-    _LAST_BACKEND = "deterministic-adapter"
-    return _fallback_suggestions(scores)
+    if not suggestions:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained suggester produced no usable suggestions")
+
+    _LAST_BACKEND = "pretrained"
+    return suggestions[:3]

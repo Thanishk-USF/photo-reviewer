@@ -43,20 +43,21 @@ photo-reviewer/
 
 ## Pretrained Rollout Flags (Backend)
 
-Set these in your backend environment to enable model-backed paths safely:
+Backend now runs in pretrained-only mode by default. If you override flags in your environment, keep all of these enabled:
 
 - `USE_PRETRAINED_SCORER=true`
 - `USE_PRETRAINED_TAGGER=true`
 - `USE_PRETRAINED_STYLE=true` (defaults to the tagger flag if unset)
 - `USE_PRETRAINED_SUGGESTER=true`
 - `MODEL_CANARY_PERCENT=100`
-- `FALLBACK_ON_MODEL_ERROR=true`
+- `FALLBACK_ON_MODEL_ERROR=false`
 
 Model IDs/devices are configurable via:
 
 - `PRETRAINED_DEVICE` (`cpu`, `cuda`, or `cuda:0`)
 - `PRETRAINED_SCORER_MODEL_ID`
 - `PRETRAINED_TAGGER_MODEL_ID`
+- `PRETRAINED_TAGGER_CAPTION_MODEL_ID`
 - `PRETRAINED_STYLE_MODEL_ID`
 - `PRETRAINED_SUGGESTER_MODEL_ID`
 
@@ -71,7 +72,7 @@ python backend/scripts/backfill_analysis_fields.py --limit 20
 Apply pretrained recompute with version label:
 
 ```bash
-python backend/scripts/backfill_analysis_fields.py --apply --use-pretrained-scorer --use-pretrained-tagger --use-pretrained-style --use-pretrained-suggester --model-version pretrained-v1
+python backend/scripts/backfill_analysis_fields.py --apply --model-version pretrained-v2
 ```
 
-If `--model-version` is omitted, the script stores the runtime-derived value (`deterministic-v1` or `pretrained-v1`).
+If `--model-version` is omitted, the script stores the runtime-derived value (`pretrained-v2`).

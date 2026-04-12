@@ -144,11 +144,11 @@ def analyze_image():
         mongo_payload = {
             **result,
             'image_hash': image_hash,
-            'model_version': runtime_meta.get('model_version', 'deterministic-v1'),
-            'score_source': runtime_meta.get('scorer_source', 'deterministic'),
-            'tagger_source': runtime_meta.get('tagger_source', 'deterministic'),
-            'style_source': runtime_meta.get('style_source', 'deterministic'),
-            'suggestion_source': runtime_meta.get('suggestion_source', 'deterministic'),
+            'model_version': runtime_meta.get('model_version', 'pretrained-v2'),
+            'score_source': runtime_meta.get('scorer_source', 'pretrained'),
+            'tagger_source': runtime_meta.get('tagger_source', 'pretrained'),
+            'style_source': runtime_meta.get('style_source', 'pretrained'),
+            'suggestion_source': runtime_meta.get('suggestion_source', 'pretrained'),
             'fallback_used': bool(runtime_meta.get('fallback_used', False)),
         }
         save_analysis(mongo_payload)

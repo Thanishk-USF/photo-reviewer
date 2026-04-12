@@ -5,17 +5,23 @@ Model-backed tag generator adapter.
 from __future__ import annotations
 
 import os
+import re
 from typing import List
 
-import numpy as np
-
 _ZERO_SHOT_PIPELINE = None
+_CAPTION_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
-_LAST_BACKEND = "deterministic-adapter"
+_CAPTION_INIT_FAILED = False
+_LAST_BACKEND = "pretrained-uninitialized"
 
 _DEFAULT_CANDIDATE_LABELS = [
+    "photo",
     "landscape",
     "portrait",
+    "night sky",
+    "moon",
+    "astronomy",
+    "space scene",
     "architecture",
     "street photography",
     "nature",
@@ -23,10 +29,16 @@ _DEFAULT_CANDIDATE_LABELS = [
     "night scene",
     "sunset",
     "sunrise",
+    "ocean",
+    "water reflection",
+    "mountain",
+    "forest",
     "city skyline",
     "minimalist composition",
     "high contrast",
     "low light",
+    "dramatic lighting",
+    "soft lighting",
     "macro photography",
     "food photography",
     "travel photography",
@@ -34,7 +46,36 @@ _DEFAULT_CANDIDATE_LABELS = [
     "vibrant colors",
     "warm tones",
     "cool tones",
+    "digital art",
+    "anime illustration",
+    "fantasy illustration",
+    "character art",
+    "cinematic scene",
+    "cloudscape",
+    "seascape",
 ]
+
+_CAPTION_PHRASE_TAGS = {
+    "night sky": "night-sky",
+    "city skyline": "city-skyline",
+    "digital art": "digital-art",
+    "anime": "anime",
+    "illustration": "illustration",
+    "fantasy": "fantasy",
+    "character": "character",
+    "moon": "moon",
+    "astronomy": "astronomy",
+    "space": "space",
+    "sunrise": "sunrise",
+    "sunset": "sunset",
+    "ocean": "ocean",
+    "water": "water",
+    "mountain": "mountain",
+    "forest": "forest",
+    "portrait": "portrait",
+    "landscape": "landscape",
+    "monochrome": "monochrome",
+}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -105,31 +146,30 @@ def _get_zero_shot_pipeline():
     return _ZERO_SHOT_PIPELINE
 
 
-def _image_features(image):
-    if image.mode != "RGB":
-        image = image.convert("RGB")
+def _get_caption_pipeline():
+    global _CAPTION_PIPELINE, _CAPTION_INIT_FAILED
 
-    rgb = np.asarray(image, dtype=np.float32) / 255.0
-    r = rgb[:, :, 0]
-    g = rgb[:, :, 1]
-    b = rgb[:, :, 2]
+    if _CAPTION_PIPELINE is not None:
+        return _CAPTION_PIPELINE
+    if _CAPTION_INIT_FAILED:
+        return None
 
-    luma = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
-    brightness = float(np.mean(luma))
-    contrast = float(np.std(luma))
+    model_id = os.environ.get("PRETRAINED_TAGGER_CAPTION_MODEL_ID", "Salesforce/blip-image-captioning-base")
+    device_name = os.environ.get("PRETRAINED_DEVICE", "cpu")
 
-    max_channel = np.max(rgb, axis=2)
-    min_channel = np.min(rgb, axis=2)
-    saturation = np.where(max_channel > 1e-6, (max_channel - min_channel) / (max_channel + 1e-6), 0.0)
-    saturation_mean = float(np.mean(saturation))
+    try:
+        from transformers import pipeline
 
-    height, width = luma.shape
-    aspect_ratio = float(width) / max(float(height), 1.0)
+        _CAPTION_PIPELINE = pipeline(
+            "image-to-text",
+            model=model_id,
+            device=_parse_device_index(device_name),
+        )
+    except Exception:
+        _CAPTION_INIT_FAILED = True
+        _CAPTION_PIPELINE = None
 
-    channel_means = np.array([float(np.mean(r)), float(np.mean(g)), float(np.mean(b))], dtype=np.float32)
-    dominant_channel = int(np.argmax(channel_means))
-
-    return brightness, contrast, saturation_mean, aspect_ratio, dominant_channel
+    return _CAPTION_PIPELINE
 
 
 def _dedupe(values: List[str]) -> List[str]:
@@ -143,39 +183,27 @@ def _dedupe(values: List[str]) -> List[str]:
     return out
 
 
-def _fallback_tags(image) -> List[str]:
-    brightness, contrast, saturation, aspect_ratio, dominant_channel = _image_features(image)
+def _extract_caption_text(captioner, image) -> str:
+    max_tokens = max(12, min(_env_int("PRETRAINED_TAGGER_CAPTION_MAX_TOKENS", 40), 80))
+    output = captioner(image, max_new_tokens=max_tokens)
 
-    tags: List[str] = ["photo"]
+    if isinstance(output, list) and output and isinstance(output[0], dict):
+        text = str(output[0].get("generated_text", "")).strip().lower()
+        if text:
+            return text
 
-    if aspect_ratio > 1.25:
-        tags.append("landscape")
-    elif aspect_ratio < 0.80:
-        tags.append("portrait")
+    raise RuntimeError("Pretrained caption model returned no caption text")
 
-    if brightness < 0.30:
-        tags.extend(["dark", "low-light"])
-    elif brightness > 0.72:
-        tags.extend(["bright", "high-key"])
 
-    if saturation < 0.12:
-        tags.append("monochrome")
-    elif saturation > 0.33:
-        tags.extend(["colorful", "vivid"])
+def _caption_tags(caption_text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", caption_text.strip().lower())
+    tags: List[str] = []
 
-    if contrast > 0.22:
-        tags.append("high-contrast")
-    elif contrast < 0.11:
-        tags.append("soft-contrast")
+    for phrase, tag in _CAPTION_PHRASE_TAGS.items():
+        if phrase in text:
+            tags.append(tag)
 
-    if dominant_channel == 0:
-        tags.append("warm-tones")
-    elif dominant_channel == 2:
-        tags.append("cool-tones")
-    else:
-        tags.append("balanced-tones")
-
-    return _dedupe(tags)[:10]
+    return _dedupe([_normalize_label(tag) for tag in tags if _normalize_label(tag)])
 
 
 def get_last_backend() -> str:
@@ -183,33 +211,38 @@ def get_last_backend() -> str:
 
 
 def generate_tags(image):
-    """
-    Generate stable tags from image features.
-
-    This adapter intentionally avoids random output so runtime behavior is
-    deterministic before heavy pretrained dependencies are introduced.
-    """
+    """Generate tags from pretrained zero-shot classification outputs only."""
     global _LAST_BACKEND
 
     classifier = _get_zero_shot_pipeline()
     if classifier is None:
-        _LAST_BACKEND = "deterministic-adapter"
-        return _fallback_tags(image)
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained tagger pipeline could not be initialized")
+
+    captioner = _get_caption_pipeline()
+    if captioner is None:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained caption pipeline could not be initialized")
 
     top_k = max(3, min(_env_int("PRETRAINED_TAGGER_TOP_K", 8), 12))
     threshold = max(0.05, min(_env_float("PRETRAINED_TAGGER_THRESHOLD", 0.18), 0.95))
 
     try:
         results = classifier(image, candidate_labels=_DEFAULT_CANDIDATE_LABELS)
-    except Exception:
-        _LAST_BACKEND = "deterministic-adapter"
-        return _fallback_tags(image)
+    except Exception as exc:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained tagger inference failed") from exc
 
     if not isinstance(results, list) or not results:
-        _LAST_BACKEND = "deterministic-adapter"
-        return _fallback_tags(image)
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained tagger returned empty predictions")
+
+    caption_text = _extract_caption_text(captioner, image)
+    caption_semantics = _caption_tags(caption_text)
 
     tags: List[str] = ["photo"]
+    filtered_labels: List[str] = []
+    fallback_labels: List[str] = []
     for item in results[:top_k]:
         if not isinstance(item, dict):
             continue
@@ -217,16 +250,21 @@ def generate_tags(image):
             score = float(item.get("score", 0.0))
         except (TypeError, ValueError):
             continue
-        if score < threshold:
-            continue
         label = _normalize_label(str(item.get("label", "")))
-        if label:
-            tags.append(label)
+        if not label:
+            continue
+        fallback_labels.append(label)
+        if score >= threshold:
+            filtered_labels.append(label)
+
+    selected = filtered_labels or fallback_labels
+    tags.extend(caption_semantics)
+    tags.extend(selected)
 
     tags = _dedupe(tags)
-    if len(tags) > 1:
-        _LAST_BACKEND = "pretrained"
-        return tags[:10]
+    if len(tags) <= 1:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained tagger produced no usable tags")
 
-    _LAST_BACKEND = "deterministic-adapter"
-    return _fallback_tags(image)
+    _LAST_BACKEND = "pretrained"
+    return tags[:10]

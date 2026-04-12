@@ -6,13 +6,74 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
-
-from app.services import scorer as baseline_scorer
+from typing import Dict, List, Sequence, Tuple
 
 _CLASSIFIER_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
-_LAST_BACKEND = "deterministic-adapter"
+_LAST_BACKEND = "pretrained-uninitialized"
+
+_PROMPT_ENSEMBLE: Dict[str, Dict[str, Sequence[str]]] = {
+    "aesthetic": {
+        "positive": (
+            "stunning professional photo",
+            "visually pleasing high quality image",
+            "beautifully composed image",
+        ),
+        "negative": (
+            "low quality unattractive image",
+            "poorly composed unattractive image",
+            "visually unappealing photo",
+        ),
+    },
+    "technical": {
+        "positive": (
+            "sharp image with clean details",
+            "technically excellent photo",
+            "well focused image",
+        ),
+        "negative": (
+            "blurry noisy image",
+            "technically flawed photo",
+            "out of focus image",
+        ),
+    },
+    "composition": {
+        "positive": (
+            "strong composition with clear subject",
+            "well balanced framing",
+            "cinematic composition",
+        ),
+        "negative": (
+            "poor composition and weak framing",
+            "cluttered composition",
+            "unbalanced framing",
+        ),
+    },
+    "lighting": {
+        "positive": (
+            "well lit scene with good exposure",
+            "pleasant lighting and tonal detail",
+            "balanced highlights and shadows",
+        ),
+        "negative": (
+            "poor lighting and weak exposure",
+            "harsh lighting with clipped tones",
+            "underexposed or overexposed image",
+        ),
+    },
+    "color": {
+        "positive": (
+            "rich natural color rendering",
+            "harmonious color palette",
+            "excellent color balance",
+        ),
+        "negative": (
+            "dull or unpleasant colors",
+            "poor color balance",
+            "oversaturated or washed out colors",
+        ),
+    },
+}
 
 
 def _clamp_score(value: float) -> float:
@@ -21,16 +82,6 @@ def _clamp_score(value: float) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _parse_device_index(device_value: str) -> int:
@@ -56,18 +107,16 @@ def _get_classifier_pipeline():
     if _PIPELINE_INIT_FAILED:
         return None
 
-    model_id = os.environ.get("PRETRAINED_SCORER_MODEL_ID", "google/vit-base-patch16-224")
+    model_id = os.environ.get("PRETRAINED_SCORER_MODEL_ID", "openai/clip-vit-base-patch32")
     device_name = os.environ.get("PRETRAINED_DEVICE", "cpu")
-    top_k = _env_int("PRETRAINED_SCORER_TOP_K", 5)
 
     try:
         from transformers import pipeline
 
         _CLASSIFIER_PIPELINE = pipeline(
-            "image-classification",
+            "zero-shot-image-classification",
             model=model_id,
             device=_parse_device_index(device_name),
-            top_k=max(1, min(top_k, 20)),
         )
     except Exception:
         _PIPELINE_INIT_FAILED = True
@@ -76,56 +125,55 @@ def _get_classifier_pipeline():
     return _CLASSIFIER_PIPELINE
 
 
-def _confidence_signal_from_predictions(predictions) -> Optional[float]:
-    scores = []
+def _normalize_predictions(predictions) -> List[Dict[str, float]]:
+    normalized: List[Dict[str, float]] = []
     for entry in predictions or []:
         if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label", "")).strip().lower()
+        if not label:
             continue
         try:
             score = float(entry.get("score", 0.0))
         except (TypeError, ValueError):
             continue
         if score > 0:
-            scores.append(score)
+            normalized.append({"label": label, "score": score})
 
-    if not scores:
-        return None
+    return normalized
 
-    total = sum(scores)
+
+def _signal_from_prompt_ensemble(classifier, image, positive: Sequence[str], negative: Sequence[str]) -> float:
+    labels = [str(label).strip() for label in list(positive) + list(negative) if str(label).strip()]
+    if not labels:
+        raise RuntimeError("Pretrained scorer prompt ensemble is empty")
+
+    predictions = classifier(image, candidate_labels=labels)
+    rows = _normalize_predictions(predictions)
+    if not rows:
+        raise RuntimeError("Pretrained scorer returned no prediction scores")
+
+    total = sum(item["score"] for item in rows)
     if total <= 0:
-        return None
+        raise RuntimeError("Pretrained scorer returned zero total score")
 
-    probs = [s / total for s in scores]
-    entropy = -sum(p * math.log(p + 1e-12) for p in probs)
-    max_entropy = math.log(float(len(probs))) if len(probs) > 1 else 1.0
-    entropy_norm = entropy / max_entropy if max_entropy > 0 else 0.0
-    certainty = 1.0 - _clamp01(entropy_norm)
-    max_score = max(scores)
+    score_map = {item["label"]: (item["score"] / total) for item in rows}
+    pos_set = {str(value).strip().lower() for value in positive}
+    neg_set = {str(value).strip().lower() for value in negative}
 
-    return _clamp01((0.60 * max_score) + (0.40 * certainty))
+    pos_sum = sum(score_map.get(label, 0.0) for label in pos_set)
+    neg_sum = sum(score_map.get(label, 0.0) for label in neg_set)
+    pn_total = pos_sum + neg_sum
+    if pn_total <= 1e-12:
+        raise RuntimeError("Pretrained scorer produced no usable positive/negative signal")
+
+    # Keep the signal model-driven but avoid collapsing scores around the bottom range.
+    signal = pos_sum / pn_total
+    return _clamp01((signal * 0.88) + 0.06)
 
 
 def _signal_to_score(signal: float) -> float:
-    # Keep score in familiar UI range even for different classifier confidence scales.
     return _clamp_score(1.0 + (_clamp01(signal) * 9.0))
-
-
-def _calibrate_baseline_scores(aesthetic: float, technical: float, composition: float, lighting: float, color: float) -> Tuple[float, float, float, float, float]:
-    """Apply a mild non-linear calibration to baseline scores.
-
-    This keeps output dynamic and deterministic without requiring heavy DL
-    dependencies during initial rollout.
-    """
-    mean_score = (aesthetic + technical + composition + lighting + color) / 5.0
-    curve = 0.15 * math.tanh((mean_score - 6.0) / 2.0)
-
-    return (
-        _clamp_score((aesthetic * 0.92) + 0.55 + curve),
-        _clamp_score((technical * 0.90) + 0.65 + curve),
-        _clamp_score((composition * 0.93) + 0.50 + curve),
-        _clamp_score((lighting * 0.91) + 0.58 + curve),
-        _clamp_score((color * 0.92) + 0.52 + curve),
-    )
 
 
 def get_last_backend() -> str:
@@ -134,64 +182,41 @@ def get_last_backend() -> str:
 
 def score_image(image):
     """
-    Score an image for aesthetic quality using a model adapter path.
-
-    During early rollout this uses calibrated deterministic features as a
-    lightweight stand-in. It is intentionally non-random.
+    Score an image using pretrained zero-shot classification outputs only.
 
     Returns:
         Tuple of (aesthetic, technical, composition, lighting, color)
     """
     global _LAST_BACKEND
 
-    quality = baseline_scorer.analyze_image_quality(image)
-    base = quality['scores_1_10']
-
-    fallback_scores = _calibrate_baseline_scores(
-        float(base['aesthetic']),
-        float(base['technical']),
-        float(base['composition']),
-        float(base['lighting']),
-        float(base['color']),
-    )
-
     classifier = _get_classifier_pipeline()
     if classifier is None:
-        _LAST_BACKEND = "deterministic-adapter"
-        return fallback_scores
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained scorer pipeline could not be initialized")
 
     try:
-        confidence_signal = _confidence_signal_from_predictions(classifier(image))
-    except Exception:
-        _LAST_BACKEND = "deterministic-adapter"
-        return fallback_scores
+        outputs: Dict[str, float] = {}
+        for dimension, groups in _PROMPT_ENSEMBLE.items():
+            signal = _signal_from_prompt_ensemble(
+                classifier,
+                image,
+                groups.get("positive", ()),
+                groups.get("negative", ()),
+            )
+            outputs[dimension] = _signal_to_score(signal)
 
-    if confidence_signal is None:
-        _LAST_BACKEND = "deterministic-adapter"
-        return fallback_scores
+        # Keep overall score coherent with model-derived subdimensions.
+        sub_mean = (outputs["technical"] + outputs["composition"] + outputs["lighting"] + outputs["color"]) / 4.0
+        outputs["aesthetic"] = _clamp_score((outputs["aesthetic"] * 0.65) + (sub_mean * 0.35))
 
-    model_aesthetic = _signal_to_score(confidence_signal)
-    normalized = quality.get('scores_normalized') if isinstance(quality, dict) else None
-    if not isinstance(normalized, dict):
-        normalized = {}
-
-    technical_norm = _clamp01(float(normalized.get('technical', float(base['technical']) / 10.0)))
-    composition_norm = _clamp01(float(normalized.get('composition', float(base['composition']) / 10.0)))
-    lighting_norm = _clamp01(float(normalized.get('lighting', float(base['lighting']) / 10.0)))
-    color_norm = _clamp01(float(normalized.get('color', float(base['color']) / 10.0)))
-
-    model_technical = _signal_to_score((0.80 * confidence_signal) + (0.20 * technical_norm))
-    model_composition = _signal_to_score((0.50 * confidence_signal) + (0.50 * composition_norm))
-    model_lighting = _signal_to_score((0.50 * confidence_signal) + (0.50 * lighting_norm))
-    model_color = _signal_to_score((0.50 * confidence_signal) + (0.50 * color_norm))
-
-    _LAST_BACKEND = "pretrained"
-
-    # Blend model-derived global signal with calibrated baseline for stable outputs.
-    return (
-        _clamp_score((fallback_scores[0] * 0.55) + (model_aesthetic * 0.45)),
-        _clamp_score((fallback_scores[1] * 0.65) + (model_technical * 0.35)),
-        _clamp_score((fallback_scores[2] * 0.80) + (model_composition * 0.20)),
-        _clamp_score((fallback_scores[3] * 0.80) + (model_lighting * 0.20)),
-        _clamp_score((fallback_scores[4] * 0.80) + (model_color * 0.20)),
-    )
+        _LAST_BACKEND = "pretrained"
+        return (
+            outputs["aesthetic"],
+            outputs["technical"],
+            outputs["composition"],
+            outputs["lighting"],
+            outputs["color"],
+        )
+    except Exception as exc:
+        _LAST_BACKEND = "pretrained-error"
+        raise RuntimeError("Pretrained scorer inference failed") from exc

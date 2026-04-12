@@ -5,15 +5,12 @@ This module keeps model selection and fallback logic in one place.
 
 from __future__ import annotations
 
-import random
 from typing import Any, Dict, Iterable, List, Tuple
 
 from app.models import scorer as model_scorer
 from app.models import style as model_style
 from app.models import suggester as model_suggester
 from app.models import tagger as model_tagger
-from app.services import content_analyzer
-from app.services import scorer as deterministic_scorer
 
 
 def _clamp_score(value: Any, default: float = 5.5) -> float:
@@ -78,146 +75,52 @@ def _tags_to_hashtags(tags: Iterable[str]) -> List[str]:
     return hashtags[:10]
 
 
-def _should_use_pretrained(app_config: Dict[str, Any], flag_name: str) -> bool:
-    if not bool(app_config.get(flag_name, False)):
-        return False
-
-    canary_percent = float(app_config.get("MODEL_CANARY_PERCENT", 100.0) or 100.0)
-    if canary_percent <= 0:
-        return False
-    if canary_percent >= 100:
-        return True
-
-    return (random.random() * 100.0) < canary_percent
-
-
-def _blend_scores(pretrained_scores: Tuple[float, float, float, float, float], baseline_scores: Dict[str, float], blend_alpha: float) -> Tuple[float, float, float, float, float]:
-    alpha = max(0.0, min(float(blend_alpha), 1.0))
-    base_tuple = (
-        float(baseline_scores["aesthetic"]),
-        float(baseline_scores["technical"]),
-        float(baseline_scores["composition"]),
-        float(baseline_scores["lighting"]),
-        float(baseline_scores["color"]),
-    )
-
-    blended = []
-    for pretrained, baseline in zip(pretrained_scores, base_tuple):
-        value = (alpha * float(pretrained)) + ((1.0 - alpha) * baseline)
-        blended.append(_clamp_score(value))
-
-    return tuple(blended)  # type: ignore[return-value]
+def _require_pretrained_enabled(app_config: Dict[str, Any], flag_name: str) -> None:
+    if bool(app_config.get(flag_name, False)):
+        return
+    raise RuntimeError(f"{flag_name} must be enabled for pretrained-only analysis")
 
 
 def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze image with pretrained models when enabled, else deterministic fallback."""
-    quality = deterministic_scorer.analyze_image_quality(image)
-    base_scores = quality["scores_1_10"]
+    """Analyze image with pretrained model outputs only (no deterministic fallback)."""
+    _require_pretrained_enabled(app_config, "USE_PRETRAINED_SCORER")
+    _require_pretrained_enabled(app_config, "USE_PRETRAINED_TAGGER")
+    _require_pretrained_enabled(app_config, "USE_PRETRAINED_STYLE")
+    _require_pretrained_enabled(app_config, "USE_PRETRAINED_SUGGESTER")
 
-    fallback_on_error = bool(app_config.get("FALLBACK_ON_MODEL_ERROR", True))
-    blend_alpha = float(app_config.get("PRETRAINED_SCORE_BLEND_ALPHA", 0.70) or 0.70)
+    aesthetic, technical, composition, lighting, color = _ensure_score_tuple(model_scorer.score_image(image))
+    scorer_source = getattr(model_scorer, "get_last_backend", lambda: "pretrained")()
 
-    # Start from deterministic values for safety.
-    active_scores = (
-        _clamp_score(base_scores["aesthetic"]),
-        _clamp_score(base_scores["technical"]),
-        _clamp_score(base_scores["composition"]),
-        _clamp_score(base_scores["lighting"]),
-        _clamp_score(base_scores["color"]),
-    )
-    scorer_source = "deterministic"
-    fallback_used = False
+    final_tags = _coerce_tags(model_tagger.generate_tags(image))
+    if not final_tags:
+        raise RuntimeError("Pretrained tagger returned no usable tags")
+    final_hashtags = _tags_to_hashtags(final_tags)
+    tagger_source = getattr(model_tagger, "get_last_backend", lambda: "pretrained")()
 
-    use_pretrained_scorer = _should_use_pretrained(app_config, "USE_PRETRAINED_SCORER")
-    if use_pretrained_scorer:
-        try:
-            pretrained_scores = _ensure_score_tuple(model_scorer.score_image(image))
-            active_scores = _blend_scores(pretrained_scores, base_scores, blend_alpha)
-            scorer_source = getattr(model_scorer, "get_last_backend", lambda: "pretrained")()
-            fallback_used = fallback_used or (scorer_source != "pretrained")
-        except Exception:
-            if not fallback_on_error:
-                raise
-            fallback_used = True
-            scorer_source = "deterministic-fallback"
+    final_style, final_mood = model_style.classify_style(image)
+    if not isinstance(final_style, str) or not final_style.strip() or not isinstance(final_mood, str) or not final_mood.strip():
+        raise RuntimeError("Pretrained style classifier returned empty labels")
+    final_style = final_style.strip()
+    final_mood = final_mood.strip()
+    style_source = getattr(model_style, "get_last_backend", lambda: "pretrained")()
 
-    aesthetic, technical, composition, lighting, color = active_scores
-
-    metadata = content_analyzer.build_analysis_metadata(
+    model_suggestions = model_suggester.generate_suggestions(
         image,
-        filename,
-        aesthetic,
-        technical,
-        composition,
-        lighting,
-        color,
-        quality=quality,
+        {
+            "aesthetic": aesthetic,
+            "technical": technical,
+            "composition": composition,
+            "lighting": lighting,
+            "color": color,
+        },
     )
+    final_suggestions = [str(item).strip() for item in model_suggestions if isinstance(item, str) and str(item).strip()]
+    if not final_suggestions:
+        raise RuntimeError("Pretrained suggester returned no usable suggestions")
+    suggestion_source = getattr(model_suggester, "get_last_backend", lambda: "pretrained")()
 
-    final_style = metadata["style"]
-    final_mood = metadata["mood"]
-    final_tags = list(metadata["tags"])
-    final_hashtags = list(metadata["hashtags"])
-    final_suggestions = list(metadata["suggestions"])
-    tagger_source = "deterministic"
-    style_source = "deterministic"
-    suggestion_source = "deterministic"
-
-    use_pretrained_tagger = _should_use_pretrained(app_config, "USE_PRETRAINED_TAGGER")
-    if use_pretrained_tagger:
-        try:
-            pretrained_tags = _coerce_tags(model_tagger.generate_tags(image))
-            if pretrained_tags:
-                final_tags = pretrained_tags
-                final_hashtags = _tags_to_hashtags(pretrained_tags)
-            tagger_source = getattr(model_tagger, "get_last_backend", lambda: "pretrained")()
-            fallback_used = fallback_used or (tagger_source != "pretrained")
-        except Exception:
-            if not fallback_on_error:
-                raise
-            fallback_used = True
-            tagger_source = "deterministic-fallback"
-
-    use_pretrained_style = _should_use_pretrained(app_config, "USE_PRETRAINED_STYLE")
-    if use_pretrained_style:
-        try:
-            style_label, mood_label = model_style.classify_style(image)
-            if isinstance(style_label, str) and style_label.strip():
-                final_style = style_label.strip()
-            if isinstance(mood_label, str) and mood_label.strip():
-                final_mood = mood_label.strip()
-            style_source = getattr(model_style, "get_last_backend", lambda: "pretrained")()
-            fallback_used = fallback_used or (style_source != "pretrained")
-        except Exception:
-            if not fallback_on_error:
-                raise
-            fallback_used = True
-            style_source = "deterministic-fallback"
-
-    use_pretrained_suggester = _should_use_pretrained(app_config, "USE_PRETRAINED_SUGGESTER")
-    if use_pretrained_suggester:
-        try:
-            model_suggestions = model_suggester.generate_suggestions(
-                image,
-                {
-                    "aesthetic": aesthetic,
-                    "technical": technical,
-                    "composition": composition,
-                    "lighting": lighting,
-                    "color": color,
-                },
-            )
-            if isinstance(model_suggestions, list) and model_suggestions:
-                final_suggestions = [str(item).strip() for item in model_suggestions if isinstance(item, str) and str(item).strip()]
-            suggestion_source = getattr(model_suggester, "get_last_backend", lambda: "pretrained")()
-            fallback_used = fallback_used or (suggestion_source != "pretrained")
-        except Exception:
-            if not fallback_on_error:
-                raise
-            fallback_used = True
-            suggestion_source = "deterministic-fallback"
-
-    used_pretrained = any(source == "pretrained" for source in (scorer_source, tagger_source, style_source, suggestion_source))
+    if not all(source == "pretrained" for source in (scorer_source, tagger_source, style_source, suggestion_source)):
+        raise RuntimeError("Non-pretrained backend detected in pretrained-only mode")
 
     return {
         "aestheticScore": aesthetic,
@@ -231,11 +134,11 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
         "hashtags": final_hashtags,
         "suggestions": final_suggestions,
         "_runtime": {
-            "model_version": "pretrained-v1" if used_pretrained else "deterministic-v1",
+            "model_version": "pretrained-v2",
             "scorer_source": scorer_source,
             "tagger_source": tagger_source,
             "style_source": style_source,
             "suggestion_source": suggestion_source,
-            "fallback_used": fallback_used,
+            "fallback_used": False,
         },
     }

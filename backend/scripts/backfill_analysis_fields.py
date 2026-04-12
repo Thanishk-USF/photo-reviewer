@@ -7,7 +7,7 @@ Usage:
   python scripts/backfill_analysis_fields.py            # dry run
   python scripts/backfill_analysis_fields.py --apply    # apply updates
   python scripts/backfill_analysis_fields.py --limit 20
-    python scripts/backfill_analysis_fields.py --use-pretrained-scorer --use-pretrained-tagger --use-pretrained-style --use-pretrained-suggester --model-version pretrained-v1
+    python scripts/backfill_analysis_fields.py --apply --model-version pretrained-v2
 """
 
 from __future__ import annotations
@@ -128,11 +128,11 @@ def backfill_document(doc: dict, image_bytes: bytes, model_version: Optional[str
         "hashtags": normalized["hashtags"],
         "suggestions": normalized["suggestions"],
         "image_hash": hashlib.sha256(image_bytes).hexdigest(),
-        "model_version": (str(model_version).strip() if model_version is not None else "") or str(runtime_meta.get("model_version", "deterministic-v1")),
-        "score_source": str(runtime_meta.get("scorer_source", "deterministic")),
-        "tagger_source": str(runtime_meta.get("tagger_source", "deterministic")),
-        "style_source": str(runtime_meta.get("style_source", "deterministic")),
-        "suggestion_source": str(runtime_meta.get("suggestion_source", "deterministic")),
+        "model_version": (str(model_version).strip() if model_version is not None else "") or str(runtime_meta.get("model_version", "pretrained-v2")),
+        "score_source": str(runtime_meta.get("scorer_source", "pretrained")),
+        "tagger_source": str(runtime_meta.get("tagger_source", "pretrained")),
+        "style_source": str(runtime_meta.get("style_source", "pretrained")),
+        "suggestion_source": str(runtime_meta.get("suggestion_source", "pretrained")),
         "fallback_used": bool(runtime_meta.get("fallback_used", False)),
     }
 
@@ -142,10 +142,10 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="Write updates to MongoDB.")
     parser.add_argument("--limit", type=int, default=0, help="Process at most N documents (0 = all).")
     parser.add_argument("--model-version", type=str, default="", help="Optional model version override. If omitted, runtime-derived model_version is used.")
-    parser.add_argument("--use-pretrained-scorer", action="store_true", help="Enable pretrained scorer path for backfill runs.")
-    parser.add_argument("--use-pretrained-tagger", action="store_true", help="Enable pretrained tagger/style path for backfill runs.")
-    parser.add_argument("--use-pretrained-style", action="store_true", help="Enable pretrained style path for backfill runs.")
-    parser.add_argument("--use-pretrained-suggester", action="store_true", help="Enable pretrained suggestion path for backfill runs.")
+    parser.add_argument("--disable-pretrained-scorer", action="store_true", help="Disable pretrained scorer path (not recommended).")
+    parser.add_argument("--disable-pretrained-tagger", action="store_true", help="Disable pretrained tagger path (not recommended).")
+    parser.add_argument("--disable-pretrained-style", action="store_true", help="Disable pretrained style path (not recommended).")
+    parser.add_argument("--disable-pretrained-suggester", action="store_true", help="Disable pretrained suggestion path (not recommended).")
     args = parser.parse_args()
 
     mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
@@ -164,11 +164,11 @@ def main() -> None:
     pretrained_count = 0
 
     runtime_config: Dict[str, object] = {
-        "USE_PRETRAINED_SCORER": bool(args.use_pretrained_scorer),
-        "USE_PRETRAINED_TAGGER": bool(args.use_pretrained_tagger),
-        "USE_PRETRAINED_STYLE": bool(args.use_pretrained_style or args.use_pretrained_tagger),
-        "USE_PRETRAINED_SUGGESTER": bool(args.use_pretrained_suggester),
-        "FALLBACK_ON_MODEL_ERROR": True,
+        "USE_PRETRAINED_SCORER": not bool(args.disable_pretrained_scorer),
+        "USE_PRETRAINED_TAGGER": not bool(args.disable_pretrained_tagger),
+        "USE_PRETRAINED_STYLE": not bool(args.disable_pretrained_style),
+        "USE_PRETRAINED_SUGGESTER": not bool(args.disable_pretrained_suggester),
+        "FALLBACK_ON_MODEL_ERROR": False,
         "MODEL_CANARY_PERCENT": 100.0,
         "PRETRAINED_SCORE_BLEND_ALPHA": float(os.environ.get("PRETRAINED_SCORE_BLEND_ALPHA", "0.7")),
     }

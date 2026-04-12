@@ -1,13 +1,14 @@
 """
 API routes for the Flask application
 """
-from flask import Blueprint, request, jsonify, send_from_directory, Response
+from flask import Blueprint, request, jsonify, send_from_directory, Response, current_app
 import os
 import uuid
 import hashlib
 from datetime import datetime
-from app.services import scorer
 from werkzeug.utils import secure_filename
+from app.models.runtime import analyze_image_runtime
+from app.services.analysis_contract import normalize_analysis_result
 
 # Create a blueprint for the API routes
 api = Blueprint('api', __name__)
@@ -93,6 +94,7 @@ def analyze_image():
             if 'id' not in existing and '_id' in existing:
                 existing['id'] = existing['_id']
             existing['success'] = True
+            existing = normalize_analysis_result(existing)
             return jsonify(existing)
 
         # Generate a unique ID for this analysis
@@ -102,26 +104,14 @@ def analyze_image():
         file_path = os.path.join(ORIGINALS_FOLDER, f"{analysis_id}_{filename}")
         file.save(file_path)
 
-        # Open once for scoring/thumbnail generation after successful save.
+        # Open once for scoring and metadata generation after successful save.
         with Image.open(file_path) as uploaded_img:
-            quality = scorer.analyze_image_quality(uploaded_img)
-            score_map = quality['scores_1_10']
-            aesthetic_score = score_map['aesthetic']
-            technical_score = score_map['technical']
-            composition = score_map['composition']
-            lighting = score_map['lighting']
-            color = score_map['color']
-            from app.services.content_analyzer import build_analysis_metadata
-            generated = build_analysis_metadata(
+            runtime_result = analyze_image_runtime(
                 uploaded_img,
                 filename,
-                aesthetic_score,
-                technical_score,
-                composition,
-                lighting,
-                color,
-                quality=quality,
+                current_app.config,
             )
+            runtime_meta = runtime_result.pop('_runtime', {})
 
             thumbnail_filename = f"{analysis_id}_thumbnail_{filename}"
             thumbnail_path = os.path.join(THUMBNAILS_FOLDER, thumbnail_filename)
@@ -129,33 +119,37 @@ def analyze_image():
             thumbnail_img.thumbnail((300, 300))
             thumbnail_img.save(thumbnail_path)
         
-        # results
-        result = {
+        # Canonical response payload (contract-safe)
+        result = normalize_analysis_result({
             'id': analysis_id,
             'success': True,
             'imageUrl': f"/api/images/{analysis_id}_{filename}",
             'thumbnailUrl': f"/api/images/{thumbnail_filename}",
             'filename': filename,
             'uploadDate': datetime.now().isoformat(),
-            'aestheticScore': round(aesthetic_score, 1),
-            'technicalScore': round(technical_score, 1),
-            'composition': round(composition, 1),
-            'lighting': round(lighting, 1),
-            'color': round(color, 1),
-            'style': generated['style'],
-            'mood': generated['mood'],
-            'tags': generated['tags'],
-            'hashtags': generated['hashtags'],
-            'suggestions': generated['suggestions'],
-        }
+            'aestheticScore': runtime_result.get('aestheticScore'),
+            'technicalScore': runtime_result.get('technicalScore'),
+            'composition': runtime_result.get('composition'),
+            'lighting': runtime_result.get('lighting'),
+            'color': runtime_result.get('color'),
+            'style': runtime_result.get('style'),
+            'mood': runtime_result.get('mood'),
+            'tags': runtime_result.get('tags'),
+            'hashtags': runtime_result.get('hashtags'),
+            'suggestions': runtime_result.get('suggestions'),
+        })
         
         # Save image data to MongoDB
-        from app.services.mongo_service import save_analysis, convert_objectid_to_str
-        mongo_id = save_analysis({**result, 'image_hash': image_hash})
-        
-        # Make sure result doesn't have any ObjectId instances
-        # This is the key fix - we need to convert any ObjectIds that might have been added
-        result = convert_objectid_to_str(result)
+        from app.services.mongo_service import save_analysis
+        mongo_payload = {
+            **result,
+            'image_hash': image_hash,
+            'model_version': runtime_meta.get('model_version', 'deterministic-v1'),
+            'score_source': runtime_meta.get('scorer_source', 'deterministic'),
+            'tagger_source': runtime_meta.get('tagger_source', 'deterministic'),
+            'fallback_used': bool(runtime_meta.get('fallback_used', False)),
+        }
+        save_analysis(mongo_payload)
         
         # Before returning the result
         print("Analysis complete, returning result")
@@ -242,14 +236,11 @@ def get_photo(photo_id):
         if not photo:
             return jsonify({'success': False, 'error': 'Photo not found'}), 404
         
-        # Ensure success flag is set
+        # Ensure success flag and stable schema
         photo['success'] = True
-        
-        # Convert any remaining ObjectId to string
-        from bson import ObjectId
-        for key, value in list(photo.items()):
-            if isinstance(value, ObjectId):
-                photo[key] = str(value)
+        photo = normalize_analysis_result(photo)
+        if 'id' not in photo:
+            photo['id'] = photo_id
         
         return jsonify(photo)
     

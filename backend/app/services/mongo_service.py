@@ -15,6 +15,14 @@ client = MongoClient(mongo_uri)
 db = client[mongo_db_name]
 photos_collection = db['photos']
 default_upload_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'uploads')
+INTERNAL_RESPONSE_FIELDS = {
+    'image_binary',
+    'image_hash',
+    'model_version',
+    'score_source',
+    'tagger_source',
+    'fallback_used',
+}
 
 
 def _upload_root_folder():
@@ -97,6 +105,12 @@ def _photo_dedup_key(photo):
         return f"thumb:{thumbnail_url}"
 
     return None
+
+
+def _strip_internal_fields(photo):
+    for key in INTERNAL_RESPONSE_FIELDS:
+        if key in photo:
+            del photo[key]
 
 def save_analysis(analysis_data):
     """
@@ -213,12 +227,8 @@ def get_photos(limit=24, offset=0, include_broken=False, include_duplicates=Fals
         # Convert any nested ObjectId to string using recursive function
         convert_objectid_to_str(photo)
         
-        # Remove binary data from response
-        if 'image_binary' in photo:
-            del photo['image_binary']
-
-        if 'image_hash' in photo:
-            del photo['image_hash']
+        # Remove non-public internal fields from response.
+        _strip_internal_fields(photo)
     
     next_offset = offset + len(photos)
     return photos, has_more, next_offset
@@ -250,12 +260,8 @@ def get_photo_by_id(photo_id):
         # Convert any nested ObjectId to string using recursive function
         convert_objectid_to_str(photo)
         
-        # Remove binary data from response
-        if 'image_binary' in photo:
-            del photo['image_binary']
-
-        if 'image_hash' in photo:
-            del photo['image_hash']
+        # Remove non-public internal fields from response.
+        _strip_internal_fields(photo)
     
     return photo
 

@@ -41,6 +41,60 @@ export interface UserPhotosResponse {
 const API_BASE_URL = env.NEXT_PUBLIC_API_BASE_URL.replace(/\/$/, "")
 const REQUEST_TIMEOUT_MS = 30000
 
+function clampScore(value: unknown, fallback = 5.5): number {
+  const numeric = typeof value === "number" ? value : Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  if (numeric < 1) return 1
+  if (numeric > 10) return 10
+  return Math.round(numeric * 10) / 10
+}
+
+function toString(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback
+}
+
+function toStringList(value: unknown, fallback: string[] = []): string[] {
+  if (!Array.isArray(value)) return fallback
+  const result: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== "string") continue
+    const token = entry.trim()
+    if (!token || result.includes(token)) continue
+    result.push(token)
+  }
+  return result.length > 0 ? result : fallback
+}
+
+function normalizeAnalysisResult(value: unknown): AnalysisResult {
+  const data = (value && typeof value === "object" ? value : {}) as Record<string, unknown>
+
+  const imageUrl = toString(data.imageUrl, "/placeholder.svg")
+  const thumbnailUrl = toString(data.thumbnailUrl, imageUrl)
+  const tags = toStringList(data.tags, ["photo"])
+  const hashtags = toStringList(
+    data.hashtags,
+    tags.map((tag) => `#${tag.toLowerCase().replace(/[^a-z0-9]+/g, "")}`).filter(Boolean),
+  )
+
+  return {
+    success: Boolean(data.success ?? true),
+    id: toString(data.id) || undefined,
+    imageUrl,
+    thumbnailUrl: thumbnailUrl || undefined,
+    aestheticScore: clampScore(data.aestheticScore),
+    technicalScore: clampScore(data.technicalScore),
+    composition: clampScore(data.composition),
+    lighting: clampScore(data.lighting),
+    color: clampScore(data.color),
+    style: toString(data.style, "Natural"),
+    mood: toString(data.mood, "Serene"),
+    tags,
+    hashtags: hashtags.length > 0 ? hashtags : ["#photography"],
+    suggestions: toStringList(data.suggestions, ["Strong image overall. Minor local contrast adjustments can add extra depth."]),
+    error: toString(data.error) || undefined,
+  }
+}
+
 async function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
@@ -96,7 +150,7 @@ export async function analyzeImage(file: File): Promise<AnalysisResult> {
 
     const result = await response.json()
     console.log("Analysis result:", result)
-    return result
+    return normalizeAnalysisResult(result)
   } catch (error) {
     console.error("Error analyzing image:", error)
     throw error
@@ -183,7 +237,7 @@ export async function getPhotoById(photoId: string): Promise<AnalysisResult> {
 
     const result = await response.json()
     console.log("Fetched photo:", result)
-    return result
+    return normalizeAnalysisResult(result)
   } catch (error) {
     console.error("Error fetching photo:", error)
     throw error

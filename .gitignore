@@ -19,6 +19,24 @@ yarn-error.log*
 # env files
 .env*
 
+# python runtime
+__pycache__/
+*.py[cod]
+*$py.class
+
+# python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# virtual environments
+.venv/
+venv/
+env/
+
 # private uploaded content
 /backend/uploads/
 /test_upload.png

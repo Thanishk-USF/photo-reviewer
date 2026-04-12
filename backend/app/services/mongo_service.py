@@ -40,6 +40,20 @@ def _resolve_existing_file(filename):
     return None
 
 
+def _delete_files_for_photo(photo):
+    for key in ('thumbnailUrl', 'imageUrl'):
+        filename = _extract_filename_from_api_image_url(photo.get(key))
+        if not filename:
+            continue
+
+        for candidate in _candidate_file_paths(filename):
+            if os.path.exists(candidate):
+                try:
+                    os.remove(candidate)
+                except OSError:
+                    pass
+
+
 def _extract_filename_from_api_image_url(url_value):
     if not isinstance(url_value, str):
         return None
@@ -285,12 +299,25 @@ def delete_photo(photo_id):
     Returns:
         True if deleted, False otherwise
     """
+    query = None
+    photo = None
+
     try:
         # Try to convert to ObjectId for MongoDB lookup
         object_id = ObjectId(photo_id)
-        result = photos_collection.delete_one({'_id': object_id})
+        query = {'_id': object_id}
+        photo = photos_collection.find_one(query)
     except Exception:
-        # If not a valid ObjectId, try deleting by the id field
-        result = photos_collection.delete_one({'id': photo_id})
-    
-    return result.deleted_count > 0
+        # If not a valid ObjectId, try lookup by the id field
+        query = {'id': photo_id}
+        photo = photos_collection.find_one(query)
+
+    if not photo:
+        return False
+
+    result = photos_collection.delete_one(query)
+    if result.deleted_count > 0:
+        _delete_files_for_photo(photo)
+        return True
+
+    return False

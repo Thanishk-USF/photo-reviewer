@@ -137,12 +137,10 @@ def _build_tags(features: Dict[str, float], filename_tokens: List[str], style: s
     semantic_hits = len(semantic_tags)
 
     ratio = features["aspect_ratio"]
-    if ratio > 1.2:
+    if ratio > 1.25:
         tags.append("landscape")
-    elif ratio < 0.85:
+    elif ratio < 0.80:
         tags.append("portrait")
-    else:
-        tags.append("square")
 
     brightness = features["mean_luma"]
     saturation = features["saturation_mean"]

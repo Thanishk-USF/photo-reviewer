@@ -5,6 +5,7 @@ from flask import Blueprint, request, jsonify, send_from_directory, Response, cu
 import os
 import uuid
 import hashlib
+import hmac
 from datetime import datetime
 from werkzeug.utils import secure_filename
 from app.models.runtime import analyze_image_runtime
@@ -37,6 +38,28 @@ def resolve_image_path(filename):
         if os.path.exists(candidate):
             return folder, filename
     return None, None
+
+
+def _admin_debug_expected_key():
+    expected = (
+        current_app.config.get('ADMIN_DEBUG_KEY')
+        or os.environ.get('ADMIN_DEBUG_KEY')
+        or os.environ.get('ADMIN_DEBUG_PASSWORD')
+        or ''
+    )
+    return str(expected).strip()
+
+
+def _is_admin_debug_authorized(req):
+    expected = _admin_debug_expected_key()
+    if not expected:
+        return False
+
+    provided = str(req.headers.get('X-Admin-Debug-Key', '')).strip()
+    if not provided:
+        return False
+
+    return hmac.compare_digest(provided, expected)
 
 @api.route('/analyze', methods=['POST'])
 def analyze_image():
@@ -265,6 +288,86 @@ def delete_photo(photo_id):
     
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@api.route('/admin/adaptive-profile', methods=['GET'])
+def get_admin_adaptive_profile():
+    """Return a protected, sanitized adaptive profile summary for admin diagnostics."""
+    if not _admin_debug_expected_key():
+        return jsonify({'success': False, 'error': 'ADMIN_DEBUG_KEY is not configured'}), 503
+
+    if not _is_admin_debug_authorized(request):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    from app.services.adaptive_learning import get_adaptive_profile
+
+    profile = get_adaptive_profile() or {}
+
+    score_means = profile.get('score_means', {}) or {}
+    score_quantiles = profile.get('score_quantiles', {}) or {}
+
+    dynamic_labels = []
+    for label in profile.get('dynamic_labels', []) or []:
+        cleaned = str(label).strip()
+        if cleaned:
+            dynamic_labels.append(cleaned)
+
+    top_learned_tags = []
+    tag_priors = profile.get('tag_priors', {}) or {}
+    if isinstance(tag_priors, dict):
+        def _prior_sort_value(item_value):
+            try:
+                return float(item_value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        sorted_tags = sorted(tag_priors.items(), key=lambda item: _prior_sort_value(item[1]), reverse=True)
+        for tag, prior in sorted_tags[:20]:
+            cleaned_tag = str(tag).strip()
+            if not cleaned_tag:
+                continue
+            try:
+                prior_value = round(float(prior), 4)
+            except (TypeError, ValueError):
+                continue
+            top_learned_tags.append({'tag': cleaned_tag, 'prior': prior_value})
+
+    top_suggestions = []
+    suggestion_pool = profile.get('suggestion_pool', []) or []
+    if isinstance(suggestion_pool, list):
+        for item in suggestion_pool[:20]:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get('text', '')).strip()
+            if not text:
+                continue
+            try:
+                freq = int(item.get('freq', 0) or 0)
+            except (TypeError, ValueError):
+                freq = 0
+            top_suggestions.append({'text': text, 'freq': freq})
+
+    payload = {
+        'success': True,
+        'profile': {
+            'sampleCount': int(profile.get('sample_count', 0) or 0),
+            'scoreMeans': score_means,
+            'scoreQuantiles': score_quantiles,
+            'dynamicLabelCount': len(dynamic_labels),
+            'dynamicLabelPreview': dynamic_labels[:30],
+            'topLearnedTags': top_learned_tags,
+            'topSuggestions': top_suggestions,
+            'adaptiveConfig': {
+                'enabled': bool(current_app.config.get('ADAPTIVE_PROFILE_ENABLED', True)),
+                'maxDocs': int(current_app.config.get('ADAPTIVE_PROFILE_MAX_DOCS', 500) or 500),
+                'cacheTtlSeconds': int(current_app.config.get('ADAPTIVE_PROFILE_CACHE_TTL_SECONDS', 300) or 300),
+                'maxDynamicTagLabels': int(current_app.config.get('ADAPTIVE_MAX_DYNAMIC_TAG_LABELS', 80) or 80),
+                'maxSuggestionPool': int(current_app.config.get('ADAPTIVE_MAX_SUGGESTION_POOL', 240) or 240),
+            },
+            'generatedAt': datetime.utcnow().isoformat() + 'Z',
+        },
+    }
+    return jsonify(payload)
 
 @api.route('/images/<filename>', methods=['GET'])
 def get_image(filename):

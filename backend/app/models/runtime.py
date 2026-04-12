@@ -92,8 +92,6 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
     scorer_source = getattr(model_scorer, "get_last_backend", lambda: "pretrained")()
 
     final_tags = _coerce_tags(model_tagger.generate_tags(image))
-    if not final_tags:
-        raise RuntimeError("Pretrained tagger returned no usable tags")
     final_hashtags = _tags_to_hashtags(final_tags)
     tagger_source = getattr(model_tagger, "get_last_backend", lambda: "pretrained")()
 

@@ -8,6 +8,8 @@ import math
 import os
 from typing import Dict, List, Sequence, Tuple
 
+from app.services.adaptive_learning import calibrate_score_from_profile, get_adaptive_profile
+
 _CLASSIFIER_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
 _LAST_BACKEND = "pretrained-uninitialized"
@@ -195,6 +197,8 @@ def score_image(image):
         raise RuntimeError("Pretrained scorer pipeline could not be initialized")
 
     try:
+        adaptive_profile = get_adaptive_profile()
+
         outputs: Dict[str, float] = {}
         for dimension, groups in _PROMPT_ENSEMBLE.items():
             signal = _signal_from_prompt_ensemble(
@@ -208,6 +212,10 @@ def score_image(image):
         # Keep overall score coherent with model-derived subdimensions.
         sub_mean = (outputs["technical"] + outputs["composition"] + outputs["lighting"] + outputs["color"]) / 4.0
         outputs["aesthetic"] = _clamp_score((outputs["aesthetic"] * 0.65) + (sub_mean * 0.35))
+
+        # Re-center with historical user distribution when enough records exist.
+        for dimension in ("aesthetic", "technical", "composition", "lighting", "color"):
+            outputs[dimension] = calibrate_score_from_profile(dimension, outputs[dimension], adaptive_profile)
 
         _LAST_BACKEND = "pretrained"
         return (

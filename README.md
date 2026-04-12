@@ -61,6 +61,48 @@ Model IDs/devices are configurable via:
 - `PRETRAINED_STYLE_MODEL_ID`
 - `PRETRAINED_SUGGESTER_MODEL_ID`
 
+Optional tag precision guardrails (reduce false-positive tags):
+
+- `PRETRAINED_TAGGER_CAPTION_AGREEMENT_MIN_SCORE=0.22`
+- `PRETRAINED_TAGGER_SENSITIVE_MIN_SCORE=0.42`
+- `PRETRAINED_TAGGER_MOON_UNGROUNDED_MIN_SCORE=0.62`
+
+## Adaptive Learning From Your Data
+
+The backend now learns from prior analysis records in MongoDB to improve relevance over time:
+
+- Score calibration to reduce persistent outliers with your own score distribution
+- Dynamic tag vocabulary expansion from your historical tags
+- Retrieval-backed suggestion enrichment from your historical suggestions
+
+Optional tuning knobs:
+
+- `ADAPTIVE_PROFILE_ENABLED=true`
+- `ADAPTIVE_PROFILE_MAX_DOCS=500`
+- `ADAPTIVE_PROFILE_CACHE_TTL_SECONDS=300`
+- `ADAPTIVE_MAX_DYNAMIC_TAG_LABELS=80`
+- `ADAPTIVE_MAX_CANDIDATE_LABELS=160`
+- `ADAPTIVE_MAX_SUGGESTION_POOL=240`
+- `ADAPTIVE_SCORE_MIN_SAMPLES=40`
+- `ADAPTIVE_SCORE_CALIBRATION_WEIGHT=0.15`
+- `ADAPTIVE_TAG_PRIOR_WEIGHT=0.35`
+
+Tags are now model-derived. The API/frontend no longer force-inject a generic `photo` tag when model output is empty.
+
+## Admin Debug Access
+
+The adaptive debug panel is available at `/admin` and requires admin login.
+
+Configure these environment variables:
+
+- `ADMIN_DEBUG_PASSWORD` (required; used for admin login session)
+- `ADMIN_DEBUG_KEY` (optional; if unset, backend falls back to `ADMIN_DEBUG_PASSWORD`)
+
+Protected surfaces:
+
+- Next.js admin session routes: `/api/admin/login`, `/api/admin/logout`, `/api/admin/profile`
+- Flask debug endpoint: `/api/admin/adaptive-profile` (requires `X-Admin-Debug-Key`)
+
 ## Backfill Existing Mongo Records
 
 Dry run:

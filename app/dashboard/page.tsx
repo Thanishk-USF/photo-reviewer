@@ -226,6 +226,9 @@ export default function Dashboard() {
           <div className="flex items-center gap-4">
             {mounted && <ThemeToggle />}
             <Button variant="ghost" size="sm" className="dark:text-gray-300 dark:hover:bg-gray-700" asChild>
+              <Link href="/admin">Admin Debug</Link>
+            </Button>
+            <Button variant="ghost" size="sm" className="dark:text-gray-300 dark:hover:bg-gray-700" asChild>
               <Link href="/">Home</Link>
             </Button>
             <Button size="sm" className="dark:bg-purple-700 dark:hover:bg-purple-600" asChild>

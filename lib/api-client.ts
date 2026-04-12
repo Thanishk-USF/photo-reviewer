@@ -70,7 +70,7 @@ function normalizeAnalysisResult(value: unknown): AnalysisResult {
 
   const imageUrl = toString(data.imageUrl, "/placeholder.svg")
   const thumbnailUrl = toString(data.thumbnailUrl, imageUrl)
-  const tags = toStringList(data.tags, ["photo"])
+  const tags = toStringList(data.tags, [])
   const hashtags = toStringList(
     data.hashtags,
     tags.map((tag) => `#${tag.toLowerCase().replace(/[^a-z0-9]+/g, "")}`).filter(Boolean),

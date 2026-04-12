@@ -19,7 +19,7 @@ SCORE_FIELDS = (
 DEFAULT_STYLE = "Natural"
 DEFAULT_MOOD = "Serene"
 DEFAULT_IMAGE_URL = "/placeholder.svg"
-DEFAULT_TAGS = ["photo"]
+DEFAULT_TAGS = []
 DEFAULT_HASHTAGS = ["#photography"]
 DEFAULT_SUGGESTIONS = [
     "Strong image overall. Minor local contrast adjustments can add extra depth.",

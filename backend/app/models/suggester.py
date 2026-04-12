@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List
 
+from app.services.adaptive_learning import get_adaptive_profile, retrieve_suggestions_from_profile
+
 _ZERO_SHOT_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
 _LAST_BACKEND = "pretrained-uninitialized"
@@ -64,6 +66,11 @@ _NEGATIVE_ISSUES = {
     "weak subject separation",
     "crooked horizon",
 }
+
+_CONFLICT_GROUPS = (
+    ("oversaturated colors", "desaturated colors"),
+    ("underexposed scene", "overexposed highlights"),
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -142,6 +149,7 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
 
     threshold = max(0.05, min(_env_float("PRETRAINED_SUGGESTER_THRESHOLD", 0.20), 0.95))
     top_k = max(2, min(_env_int("PRETRAINED_SUGGESTER_TOP_K", 3), 5))
+    adaptive_profile = get_adaptive_profile()
 
     try:
         predictions = classifier(image, candidate_labels=_ISSUE_LABELS)
@@ -154,6 +162,8 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
     fallback_labels: List[str] = []
     top_label = ""
     top_score = 0.0
+    label_scores: Dict[str, float] = {}
+    selected_issue_labels: List[str] = []
 
     if isinstance(predictions, list):
         for entry in predictions[:top_k]:
@@ -167,6 +177,7 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
 
             if label:
                 fallback_labels.append(label)
+                label_scores[label] = max(float(label_scores.get(label, 0.0)), score)
                 if score > top_score:
                     top_score = score
                     top_label = label
@@ -177,12 +188,34 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
             if label not in _NEGATIVE_ISSUES:
                 continue
 
+            selected_issue_labels.append(label)
+
+    if selected_issue_labels:
+        active_labels = set(selected_issue_labels)
+        for left, right in _CONFLICT_GROUPS:
+            if left in active_labels and right in active_labels:
+                left_score = float(label_scores.get(left, 0.0))
+                right_score = float(label_scores.get(right, 0.0))
+                keep = left if left_score >= right_score else right
+                drop = right if keep == left else left
+                active_labels.discard(drop)
+
+        ordered_labels: List[str] = []
+        ordered_seen = set()
+        for label in selected_issue_labels:
+            if label not in active_labels or label in ordered_seen:
+                continue
+            ordered_seen.add(label)
+            ordered_labels.append(label)
+
+        for label in ordered_labels:
             suggestion = _ISSUE_SUGGESTIONS.get(label)
             if not suggestion or suggestion in seen:
                 continue
-
             seen.add(suggestion)
             suggestions.append(suggestion)
+            if len(suggestions) >= 3:
+                break
 
     if not suggestions:
         ordered_labels = [top_label] + fallback_labels if top_label else list(fallback_labels)
@@ -192,6 +225,46 @@ def generate_suggestions(image, scores: Dict[str, float]) -> List[str]:
                 continue
             seen.add(suggestion)
             suggestions.append(suggestion)
+            if len(suggestions) >= 3:
+                break
+
+    if len(suggestions) < 3:
+        query_terms: List[str] = []
+        query_terms.extend(fallback_labels[:3])
+
+        try:
+            composition_score = float(scores.get("composition", 0.0))
+        except (TypeError, ValueError):
+            composition_score = 0.0
+        try:
+            lighting_score = float(scores.get("lighting", 0.0))
+        except (TypeError, ValueError):
+            lighting_score = 0.0
+        try:
+            color_score = float(scores.get("color", 0.0))
+        except (TypeError, ValueError):
+            color_score = 0.0
+        try:
+            technical_score = float(scores.get("technical", 0.0))
+        except (TypeError, ValueError):
+            technical_score = 0.0
+
+        if composition_score < 6.0:
+            query_terms.extend(["composition", "framing", "background"])
+        if lighting_score < 6.0:
+            query_terms.extend(["lighting", "exposure", "shadow"])
+        if color_score < 6.0:
+            query_terms.extend(["color", "white balance", "vibrance"])
+        if technical_score < 6.0:
+            query_terms.extend(["sharpness", "noise", "focus"])
+
+        adaptive_suggestions = retrieve_suggestions_from_profile(query_terms, adaptive_profile, limit=3)
+        for suggestion in adaptive_suggestions:
+            normalized = str(suggestion).strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            suggestions.append(str(suggestion).strip())
             if len(suggestions) >= 3:
                 break
 

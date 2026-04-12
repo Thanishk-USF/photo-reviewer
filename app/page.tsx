@@ -152,7 +152,7 @@ export default function Home() {
             <Link
               href="/dashboard"
               className="rounded-lg bg-purple-600 px-4 py-2 text-white hover:bg-purple-700 
-              dark:bg-purple-700 dark:hover:bg-purple-600"
+              dark:bg-purple-700 dark:text-black dark:hover:bg-purple-600"
             >
               Dashboard
             </Link>

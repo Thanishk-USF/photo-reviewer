@@ -24,6 +24,16 @@ def _env_float(name, default=0.0):
     except (TypeError, ValueError):
         return default
 
+
+def _env_int(name, default=0):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 class Config:
     """Base configuration"""
     # Flask settings
@@ -51,6 +61,20 @@ class Config:
     PRETRAINED_TAGGER_CAPTION_MODEL_ID = os.environ.get('PRETRAINED_TAGGER_CAPTION_MODEL_ID', 'Salesforce/blip-image-captioning-base')
     PRETRAINED_STYLE_MODEL_ID = os.environ.get('PRETRAINED_STYLE_MODEL_ID', PRETRAINED_TAGGER_MODEL_ID)
     PRETRAINED_SUGGESTER_MODEL_ID = os.environ.get('PRETRAINED_SUGGESTER_MODEL_ID', PRETRAINED_TAGGER_MODEL_ID)
+
+    # Adaptive profiling (learn from historical analyses)
+    ADAPTIVE_PROFILE_ENABLED = _env_bool('ADAPTIVE_PROFILE_ENABLED', True)
+    ADAPTIVE_PROFILE_MAX_DOCS = _env_int('ADAPTIVE_PROFILE_MAX_DOCS', 500)
+    ADAPTIVE_PROFILE_CACHE_TTL_SECONDS = _env_int('ADAPTIVE_PROFILE_CACHE_TTL_SECONDS', 300)
+    ADAPTIVE_MAX_DYNAMIC_TAG_LABELS = _env_int('ADAPTIVE_MAX_DYNAMIC_TAG_LABELS', 80)
+    ADAPTIVE_MAX_CANDIDATE_LABELS = _env_int('ADAPTIVE_MAX_CANDIDATE_LABELS', 160)
+    ADAPTIVE_MAX_SUGGESTION_POOL = _env_int('ADAPTIVE_MAX_SUGGESTION_POOL', 240)
+    ADAPTIVE_SCORE_MIN_SAMPLES = _env_int('ADAPTIVE_SCORE_MIN_SAMPLES', 40)
+    ADAPTIVE_SCORE_CALIBRATION_WEIGHT = _env_float('ADAPTIVE_SCORE_CALIBRATION_WEIGHT', 0.15)
+    ADAPTIVE_TAG_PRIOR_WEIGHT = _env_float('ADAPTIVE_TAG_PRIOR_WEIGHT', 0.35)
+
+    # Admin debug access
+    ADMIN_DEBUG_KEY = os.environ.get('ADMIN_DEBUG_KEY') or os.environ.get('ADMIN_DEBUG_PASSWORD', '')
 
 class DevelopmentConfig(Config):
     """Development configuration"""

@@ -8,6 +8,8 @@ import os
 import re
 from typing import List
 
+from app.services.adaptive_learning import expand_candidate_labels, get_adaptive_profile, rerank_tags_with_profile
+
 _ZERO_SHOT_PIPELINE = None
 _CAPTION_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
@@ -15,7 +17,6 @@ _CAPTION_INIT_FAILED = False
 _LAST_BACKEND = "pretrained-uninitialized"
 
 _DEFAULT_CANDIDATE_LABELS = [
-    "photo",
     "landscape",
     "portrait",
     "night sky",
@@ -76,6 +77,8 @@ _CAPTION_PHRASE_TAGS = {
     "landscape": "landscape",
     "monochrome": "monochrome",
 }
+
+_SENSITIVE_TAGS = {"moon", "astronomy"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -206,6 +209,20 @@ def _caption_tags(caption_text: str) -> List[str]:
     return _dedupe([_normalize_label(tag) for tag in tags if _normalize_label(tag)])
 
 
+def _min_score_for_label(label: str, base_threshold: float, caption_semantics: List[str]) -> float:
+    minimum = base_threshold
+    sensitive_min = max(0.05, min(_env_float("PRETRAINED_TAGGER_SENSITIVE_MIN_SCORE", 0.42), 0.99))
+    moon_ungrounded_min = max(sensitive_min, min(_env_float("PRETRAINED_TAGGER_MOON_UNGROUNDED_MIN_SCORE", 0.62), 0.99))
+
+    if label in _SENSITIVE_TAGS:
+        minimum = max(minimum, sensitive_min)
+
+    if label == "moon" and "moon" not in caption_semantics:
+        minimum = max(minimum, moon_ungrounded_min)
+
+    return minimum
+
+
 def get_last_backend() -> str:
     return _LAST_BACKEND
 
@@ -224,11 +241,15 @@ def generate_tags(image):
         _LAST_BACKEND = "pretrained-error"
         raise RuntimeError("Pretrained caption pipeline could not be initialized")
 
+    adaptive_profile = get_adaptive_profile()
+    candidate_labels = expand_candidate_labels(_DEFAULT_CANDIDATE_LABELS, adaptive_profile)
+
     top_k = max(3, min(_env_int("PRETRAINED_TAGGER_TOP_K", 8), 12))
     threshold = max(0.05, min(_env_float("PRETRAINED_TAGGER_THRESHOLD", 0.18), 0.95))
+    caption_agreement_min = max(0.05, min(_env_float("PRETRAINED_TAGGER_CAPTION_AGREEMENT_MIN_SCORE", 0.22), 0.95))
 
     try:
-        results = classifier(image, candidate_labels=_DEFAULT_CANDIDATE_LABELS)
+        results = classifier(image, candidate_labels=candidate_labels)
     except Exception as exc:
         _LAST_BACKEND = "pretrained-error"
         raise RuntimeError("Pretrained tagger inference failed") from exc
@@ -237,12 +258,8 @@ def generate_tags(image):
         _LAST_BACKEND = "pretrained-error"
         raise RuntimeError("Pretrained tagger returned empty predictions")
 
-    caption_text = _extract_caption_text(captioner, image)
-    caption_semantics = _caption_tags(caption_text)
-
-    tags: List[str] = ["photo"]
-    filtered_labels: List[str] = []
-    fallback_labels: List[str] = []
+    label_scores = {}
+    ordered_labels: List[str] = []
     for item in results[:top_k]:
         if not isinstance(item, dict):
             continue
@@ -253,18 +270,35 @@ def generate_tags(image):
         label = _normalize_label(str(item.get("label", "")))
         if not label:
             continue
-        fallback_labels.append(label)
-        if score >= threshold:
+        label_scores[label] = max(float(label_scores.get(label, 0.0)), score)
+        if label not in ordered_labels:
+            ordered_labels.append(label)
+
+    caption_text = _extract_caption_text(captioner, image)
+    raw_caption_semantics = _caption_tags(caption_text)
+    caption_semantics = [
+        label
+        for label in raw_caption_semantics
+        if float(label_scores.get(label, 0.0)) >= caption_agreement_min
+    ]
+
+    filtered_labels: List[str] = []
+    for label in ordered_labels:
+        score = float(label_scores.get(label, 0.0))
+        min_required = _min_score_for_label(label, threshold, caption_semantics)
+        if score >= min_required:
             filtered_labels.append(label)
 
-    selected = filtered_labels or fallback_labels
+    selected = filtered_labels
+    tags: List[str] = []
     tags.extend(caption_semantics)
     tags.extend(selected)
 
     tags = _dedupe(tags)
-    if len(tags) <= 1:
-        _LAST_BACKEND = "pretrained-error"
-        raise RuntimeError("Pretrained tagger produced no usable tags")
+    tags = rerank_tags_with_profile(tags, adaptive_profile)
+    if len(tags) < 1:
+        _LAST_BACKEND = "pretrained"
+        return []
 
     _LAST_BACKEND = "pretrained"
     return tags[:10]

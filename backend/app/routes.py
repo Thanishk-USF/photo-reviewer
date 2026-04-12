@@ -147,6 +147,8 @@ def analyze_image():
             'model_version': runtime_meta.get('model_version', 'deterministic-v1'),
             'score_source': runtime_meta.get('scorer_source', 'deterministic'),
             'tagger_source': runtime_meta.get('tagger_source', 'deterministic'),
+            'style_source': runtime_meta.get('style_source', 'deterministic'),
+            'suggestion_source': runtime_meta.get('suggestion_source', 'deterministic'),
             'fallback_used': bool(runtime_meta.get('fallback_used', False)),
         }
         save_analysis(mongo_payload)

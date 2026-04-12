@@ -19,8 +19,11 @@ INTERNAL_RESPONSE_FIELDS = {
     'image_binary',
     'image_hash',
     'model_version',
+    'legacy_analysis',
     'score_source',
     'tagger_source',
+    'style_source',
+    'suggestion_source',
     'fallback_used',
 }
 

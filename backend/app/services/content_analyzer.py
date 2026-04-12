@@ -37,9 +37,27 @@ def _extract_basic_features(image) -> Dict[str, float]:
     grad_y, grad_x = np.gradient(luma)
     grad_mag = np.sqrt((grad_x * grad_x) + (grad_y * grad_y))
     edge_strength = float(np.mean(grad_mag))
+    edge_var = float(np.var(grad_mag))
+
+    total_grad = float(np.sum(grad_mag))
+    if total_grad > 1e-12:
+        p = (grad_mag / total_grad).astype(np.float64).ravel()
+        p = p[p > 0]
+        entropy = -float(np.sum(p * np.log(p + 1e-12)))
+        detail_entropy = _clamp01(entropy / np.log(max(float(p.size), 2.0))) if p.size > 1 else 0.0
+    else:
+        detail_entropy = 0.0
 
     channel_means = np.array([float(np.mean(r)), float(np.mean(g)), float(np.mean(b))], dtype=np.float32)
     dominant_channel = int(np.argmax(channel_means))
+    color_cast = float(np.max(channel_means) - np.min(channel_means))
+
+    rg = r - g
+    yb = 0.5 * (r + g) - b
+    colorfulness = float(np.sqrt(np.std(rg) ** 2 + np.std(yb) ** 2) + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2))
+
+    p5, p95 = np.percentile(luma, [5, 95])
+    dynamic_range = float(p95 - p5)
 
     height, width = luma.shape
     aspect_ratio = float(width) / max(float(height), 1.0)
@@ -49,6 +67,11 @@ def _extract_basic_features(image) -> Dict[str, float]:
         "std_luma": std_luma,
         "saturation_mean": saturation_mean,
         "edge_strength": edge_strength,
+        "edge_var": edge_var,
+        "detail_entropy": detail_entropy,
+        "colorfulness": colorfulness,
+        "color_cast": color_cast,
+        "dynamic_range": dynamic_range,
         "dominant_channel": dominant_channel,
         "aspect_ratio": aspect_ratio,
     }
@@ -64,14 +87,18 @@ def _infer_style_and_mood(features: Dict[str, float], scores: Dict[str, float]) 
     saturation = features["saturation_mean"]
     brightness = features["mean_luma"]
     contrast = features["std_luma"]
-    edge = features["edge_strength"]
+    edge = features.get("edge_strength", features.get("edge_mean", 0.0))
+    detail_entropy = features.get("detail_entropy", 0.0)
+    colorfulness = features.get("colorfulness", 0.0)
 
     if saturation < 0.12:
         style = "Monochrome"
+    elif detail_entropy < 0.22 and edge < 0.045:
+        style = "Minimalist"
+    elif colorfulness > 0.30 and saturation > 0.28:
+        style = "Vibrant"
     elif edge < 0.055 and contrast < 0.16:
         style = "Minimalist"
-    elif saturation > 0.35 and scores["color"] >= 7.0:
-        style = "Vibrant"
     elif scores["technical"] >= 7.5 and contrast > 0.20:
         style = "HDR"
     else:
@@ -93,6 +120,21 @@ def _infer_style_and_mood(features: Dict[str, float], scores: Dict[str, float]) 
 
 def _build_tags(features: Dict[str, float], filename_tokens: List[str], style: str, mood: str) -> List[str]:
     tags: List[str] = []
+
+    keyword_map = {
+        "moon": ["moon", "night-sky", "astronomy"],
+        "eclipse": ["eclipse", "space", "astronomy"],
+        "space": ["space", "cosmic"],
+        "cat": ["cat", "animal", "pet"],
+        "anime": ["anime", "illustration"],
+        "portrait": ["portrait", "character"],
+    }
+    token_set = set(filename_tokens)
+    semantic_tags = []
+    for token, inferred in keyword_map.items():
+        if token in token_set:
+            semantic_tags.extend(inferred)
+    semantic_hits = len(semantic_tags)
 
     ratio = features["aspect_ratio"]
     if ratio > 1.2:
@@ -117,32 +159,31 @@ def _build_tags(features: Dict[str, float], filename_tokens: List[str], style: s
     elif saturation > 0.35:
         tags.append("colorful")
 
-    if contrast > 0.22:
+    if contrast > 0.24:
         tags.append("high-contrast")
-    elif contrast < 0.12:
+    elif contrast < 0.11:
         tags.append("soft-contrast")
 
-    if dominant_channel == 2:
-        tags.append("cool-tones")
-    elif dominant_channel == 0:
-        tags.append("warm-tones")
+    color_cast = features.get("color_cast", 0.0)
+    if color_cast > 0.07:
+        if dominant_channel == 2:
+            tags.append("cool-tones")
+        elif dominant_channel == 0:
+            tags.append("warm-tones")
 
-    keyword_map = {
-        "moon": ["moon", "night-sky", "astronomy"],
-        "eclipse": ["eclipse", "space", "astronomy"],
-        "space": ["space", "cosmic"],
-        "cat": ["cat", "animal", "pet"],
-        "anime": ["anime", "illustration"],
-        "portrait": ["portrait", "character"],
-    }
+    colorfulness = features.get("colorfulness", 0.0)
+    detail_entropy = features.get("detail_entropy", 0.0)
+    dynamic_range = features.get("dynamic_range", 0.0)
+    if colorfulness > 0.28 and saturation > 0.25 and semantic_hits == 0:
+        tags.append("vivid")
+    if detail_entropy > 0.45 and semantic_hits == 0:
+        tags.append("detailed")
+    elif detail_entropy < 0.18 and semantic_hits == 0:
+        tags.append("clean-background")
+    if dynamic_range > 0.60 and semantic_hits == 0:
+        tags.append("wide-dynamic-range")
 
-    token_set = set(filename_tokens)
-    for token, inferred in keyword_map.items():
-        if token in token_set:
-            tags.extend(inferred)
-
-    tags.append(style.lower())
-    tags.append(mood.lower())
+    tags.extend(semantic_tags)
 
     deduped = []
     seen = set()
@@ -201,7 +242,22 @@ def _build_suggestions(scores: Dict[str, float], features: Dict[str, float]) -> 
 
 
 def _build_hashtags(tags: List[str], style: str, mood: str) -> List[str]:
-    base = tags[:8] + [style.lower(), mood.lower(), "photography"]
+    contextual = []
+    tag_set = set(tags)
+    if "landscape" in tag_set:
+        contextual.append("landscapephotography")
+    if "portrait" in tag_set:
+        contextual.append("portraitphotography")
+    if any(t in tag_set for t in ("moon", "night-sky", "eclipse", "astronomy", "space")):
+        contextual.append("astrophotography")
+    if "monochrome" in tag_set:
+        contextual.append("bnwphotography")
+    if "colorful" in tag_set or "vivid" in tag_set:
+        contextual.append("colorgrading")
+
+    base = tags[:8] + contextual + ["photography"]
+    if len(base) < 8:
+        base.extend([style.lower(), mood.lower()])
     normalized = []
     seen = set()
     for tag in base:
@@ -215,7 +271,7 @@ def _build_hashtags(tags: List[str], style: str, mood: str) -> List[str]:
     return normalized[:10]
 
 
-def build_analysis_metadata(image, filename: str, aesthetic_score: float, technical_score: float, composition: float, lighting: float, color: float):
+def build_analysis_metadata(image, filename: str, aesthetic_score: float, technical_score: float, composition: float, lighting: float, color: float, quality: Dict | None = None):
     scores = {
         "aesthetic": float(aesthetic_score),
         "technical": float(technical_score),
@@ -224,7 +280,7 @@ def build_analysis_metadata(image, filename: str, aesthetic_score: float, techni
         "color": float(color),
     }
 
-    features = _extract_basic_features(image)
+    features = quality.get("features") if quality and quality.get("features") else _extract_basic_features(image)
     filename_tokens = _extract_filename_tokens(filename)
 
     style, mood = _infer_style_and_mood(features, scores)

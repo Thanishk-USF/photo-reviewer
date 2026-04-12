@@ -104,7 +104,13 @@ def analyze_image():
 
         # Open once for scoring/thumbnail generation after successful save.
         with Image.open(file_path) as uploaded_img:
-            aesthetic_score, technical_score, composition, lighting, color = scorer.score_image(uploaded_img)
+            quality = scorer.analyze_image_quality(uploaded_img)
+            score_map = quality['scores_1_10']
+            aesthetic_score = score_map['aesthetic']
+            technical_score = score_map['technical']
+            composition = score_map['composition']
+            lighting = score_map['lighting']
+            color = score_map['color']
             from app.services.content_analyzer import build_analysis_metadata
             generated = build_analysis_metadata(
                 uploaded_img,
@@ -114,6 +120,7 @@ def analyze_image():
                 composition,
                 lighting,
                 color,
+                quality=quality,
             )
 
             thumbnail_filename = f"{analysis_id}_thumbnail_{filename}"

@@ -14,7 +14,7 @@ function unauthorized() {
   )
 }
 
-export async function GET(request: NextRequest) {
+export async function POST(request: NextRequest) {
   const sessionToken = request.cookies.get(ADMIN_SESSION_COOKIE_NAME)?.value
   if (!isValidAdminSessionToken(sessionToken)) {
     return unauthorized()
@@ -31,27 +31,28 @@ export async function GET(request: NextRequest) {
     )
   }
 
+  let payload: { runInference?: boolean } = {}
   try {
-    const requestUrl = new URL(request.url)
-    const upstreamUrl = new URL(`${FLASK_API_URL}/api/admin/adaptive-profile`)
-    const refresh = requestUrl.searchParams.get("refresh")
-    if (refresh) {
-      upstreamUrl.searchParams.set("refresh", refresh)
-    }
+    payload = (await request.json()) as { runInference?: boolean }
+  } catch {
+    payload = {}
+  }
 
-    const response = await fetch(upstreamUrl.toString(), {
-      method: "GET",
+  try {
+    const response = await fetch(`${FLASK_API_URL}/api/admin/warmup`, {
+      method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Admin-Debug-Key": adminDebugKey,
       },
+      body: JSON.stringify({ runInference: Boolean(payload.runInference) }),
       cache: "no-store",
     })
 
     const contentType = response.headers.get("content-type") || ""
     if (contentType.includes("application/json")) {
-      const payload = await response.json()
-      return NextResponse.json(payload, { status: response.status })
+      const data = await response.json()
+      return NextResponse.json(data, { status: response.status })
     }
 
     const text = await response.text()
@@ -63,7 +64,7 @@ export async function GET(request: NextRequest) {
       { status: 502 },
     )
   } catch (error) {
-    console.error("Admin profile proxy error:", error)
+    console.error("Admin warmup proxy error:", error)
     return NextResponse.json(
       {
         success: false,

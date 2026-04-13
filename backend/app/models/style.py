@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import os
 
+from app.services.device_policy import build_transformers_pipeline
+
 _ZERO_SHOT_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
 _LAST_BACKEND = "pretrained-uninitialized"
+_ACTIVE_DEVICE = "uninitialized"
 
 _STYLE_LABELS = [
     "minimalist",
@@ -32,23 +35,8 @@ _MOOD_LABELS = [
 ]
 
 
-def _parse_device_index(device_value: str) -> int:
-    value = (device_value or "cpu").strip().lower()
-    if value in {"cpu", "-1"}:
-        return -1
-    if value.isdigit():
-        return int(value)
-    if value.startswith("cuda"):
-        if ":" in value:
-            _, _, suffix = value.partition(":")
-            if suffix.isdigit():
-                return int(suffix)
-        return 0
-    return -1
-
-
 def _get_zero_shot_pipeline():
-    global _ZERO_SHOT_PIPELINE, _PIPELINE_INIT_FAILED
+    global _ZERO_SHOT_PIPELINE, _PIPELINE_INIT_FAILED, _ACTIVE_DEVICE
 
     if _ZERO_SHOT_PIPELINE is not None:
         return _ZERO_SHOT_PIPELINE
@@ -56,15 +44,10 @@ def _get_zero_shot_pipeline():
         return None
 
     model_id = os.environ.get("PRETRAINED_STYLE_MODEL_ID", os.environ.get("PRETRAINED_TAGGER_MODEL_ID", "openai/clip-vit-base-patch32"))
-    device_name = os.environ.get("PRETRAINED_DEVICE", "cpu")
-
     try:
-        from transformers import pipeline
-
-        _ZERO_SHOT_PIPELINE = pipeline(
+        _ZERO_SHOT_PIPELINE, _ACTIVE_DEVICE = build_transformers_pipeline(
             "zero-shot-image-classification",
-            model=model_id,
-            device=_parse_device_index(device_name),
+            model_id,
         )
     except Exception:
         _PIPELINE_INIT_FAILED = True
@@ -80,6 +63,16 @@ def _title_label(label):
 
 def get_last_backend() -> str:
     return _LAST_BACKEND
+
+
+def get_active_device() -> str:
+    return _ACTIVE_DEVICE
+
+
+def warmup():
+    if _get_zero_shot_pipeline() is None:
+        raise RuntimeError("Pretrained style pipeline could not be initialized")
+    return True
 
 
 def classify_style(image):

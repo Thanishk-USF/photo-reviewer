@@ -16,11 +16,14 @@ import { useTheme } from "next-themes"
 export default function Results() {
   const searchParams = useSearchParams()
   const photoId = searchParams.get("id")
-  const { theme, resolvedTheme } = useTheme()
+  const batchIdsParam = searchParams.get("ids")
+  const { theme } = useTheme()
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [mounted, setMounted] = useState(false)
+  const [batchResults, setBatchResults] = useState<AnalysisResult[]>([])
+  const [activeBatchIndex, setActiveBatchIndex] = useState(0)
 
   // Prevent hydration mismatch
   useEffect(() => {
@@ -42,12 +45,62 @@ export default function Results() {
       try {
         setLoading(true)
         setError(null)
+        setBatchResults([])
+        setActiveBatchIndex(0)
+
+        if (batchIdsParam) {
+          const batchIds = Array.from(
+            new Set(
+              batchIdsParam
+                .split(",")
+                .map((id) => id.trim())
+                .filter((id) => id.length > 0),
+            ),
+          )
+
+          if (batchIds.length > 0) {
+            const loadedBatch = (
+              await Promise.all(
+                batchIds.map(async (id) => {
+                  try {
+                    return await getPhotoById(id)
+                  } catch {
+                    return null
+                  }
+                }),
+              )
+            ).filter((item): item is AnalysisResult => Boolean(item))
+
+            if (loadedBatch.length === 0) {
+              throw new Error("No batch results found")
+            }
+
+            setBatchResults(loadedBatch)
+            setActiveBatchIndex(0)
+            setResults(loadedBatch[0])
+            return
+          }
+        }
 
         if (photoId) {
           // If we have an ID, fetch the results from the API
           const data = await getPhotoById(photoId)
           setResults(data)
         } else {
+          const storedBatch = sessionStorage.getItem("latestBatchAnalysis")
+          if (storedBatch) {
+            const parsed = JSON.parse(storedBatch)
+            if (Array.isArray(parsed)) {
+              const batch = parsed.filter((item): item is AnalysisResult => Boolean(item && item.success))
+              if (batch.length > 1) {
+                setBatchResults(batch)
+                setActiveBatchIndex(0)
+                setResults(batch[0])
+                return
+              }
+            }
+          }
+
           // Otherwise, try to get the results from sessionStorage
           const storedResults = sessionStorage.getItem("latestAnalysis")
           if (storedResults) {
@@ -65,7 +118,7 @@ export default function Results() {
     }
 
     loadResults()
-  }, [photoId])
+  }, [photoId, batchIdsParam])
 
   const scoreToColor = (score: number) => {
     if (score >= 8) return "bg-green-500"
@@ -226,6 +279,36 @@ export default function Results() {
           </div>
 
           <div className="lg:col-span-2">
+            {batchResults.length > 1 && (
+              <Card className="mb-6">
+                <CardContent className="p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h3 className="text-base font-semibold">Batch Results</h3>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">{batchResults.length} photos analyzed</span>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {batchResults.map((item, index) => {
+                      const isActive = index === activeBatchIndex
+                      return (
+                        <Button
+                          key={`${item.id || "batch"}-${index}`}
+                          variant={isActive ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => {
+                            setActiveBatchIndex(index)
+                            setResults(item)
+                          }}
+                          className={isActive ? "dark:bg-purple-700 dark:hover:bg-purple-600" : ""}
+                        >
+                          Photo {index + 1}
+                        </Button>
+                      )
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
             <Card className="mb-6">
               <CardContent className="p-6">
                 <h3 className="mb-4 text-lg font-semibold">Aesthetic Analysis</h3>

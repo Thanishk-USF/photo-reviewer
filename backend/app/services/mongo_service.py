@@ -21,9 +21,13 @@ INTERNAL_RESPONSE_FIELDS = {
     'model_version',
     'legacy_analysis',
     'score_source',
+    'aesthetic_source',
     'tagger_source',
     'style_source',
     'suggestion_source',
+    'tag_confidences',
+    'inference_devices',
+    'device_policy',
     'fallback_used',
 }
 
@@ -115,7 +119,7 @@ def _strip_internal_fields(photo):
         if key in photo:
             del photo[key]
 
-def save_analysis(analysis_data):
+def save_analysis(analysis_data, overwrite_existing=False):
     """
     Save photo analysis data to MongoDB
     
@@ -146,10 +150,13 @@ def save_analysis(analysis_data):
             document['image_binary'] = img_file.read()
     
     # Avoid duplicate inserts when the same image hash was already analyzed.
+    # Optionally overwrite existing records to refresh stale model outputs.
     image_hash = document.get('image_hash')
     if image_hash:
         existing = photos_collection.find_one({'image_hash': image_hash}, {'_id': 1})
         if existing and '_id' in existing:
+            if overwrite_existing:
+                photos_collection.update_one({'_id': existing['_id']}, {'$set': document})
             return str(existing['_id'])
 
     # Insert the document

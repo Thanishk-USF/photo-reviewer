@@ -24,6 +24,7 @@ _PROFILE_CACHE: Dict[str, object] = {
 }
 
 _SCORE_DIMENSIONS = ("aesthetic", "technical", "composition", "lighting", "color")
+_SENSITIVE_TAGS = {"moon", "astronomy"}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -94,18 +95,42 @@ def _default_profile() -> Dict[str, object]:
         "tag_priors": {},
         "dynamic_labels": [],
         "suggestion_pool": [],
+        "adaptive_epoch": 0,
     }
 
 
-def _build_profile_from_docs(docs: Iterable[dict]) -> Dict[str, object]:
+def invalidate_adaptive_profile_cache() -> None:
+    """Invalidate cached adaptive profile so next read reflects latest records."""
+    with _PROFILE_CACHE_LOCK:
+        _PROFILE_CACHE["value"] = None
+        _PROFILE_CACHE["expires_at"] = 0.0
+
+
+def _build_profile_from_docs(docs: Iterable[dict], adaptive_epoch: int) -> Dict[str, object]:
     score_values: Dict[str, List[float]] = {dim: [] for dim in _SCORE_DIMENSIONS}
     tag_counter: Counter[str] = Counter()
+    tag_weight_counter: Dict[str, float] = {}
     suggestion_counter: Counter[str] = Counter()
     suggestion_display: Dict[str, str] = {}
+    base_tag_min_confidence = max(0.0, min(_env_float("ADAPTIVE_TAG_MIN_CONFIDENCE", 0.35), 1.0))
+    sensitive_tag_min_confidence = max(
+        base_tag_min_confidence,
+        min(_env_float("ADAPTIVE_TAG_SENSITIVE_MIN_CONFIDENCE", 0.55), 1.0),
+    )
+    require_confidence = _env_bool("ADAPTIVE_REQUIRE_TAG_CONFIDENCE", False)
+    min_prior_occurrences = max(1, min(_env_int("ADAPTIVE_TAG_MIN_OCCURRENCES", 2), 20))
+    min_dynamic_occurrences = max(
+        min_prior_occurrences,
+        min(_env_int("ADAPTIVE_DYNAMIC_TAG_MIN_OCCURRENCES", 3), 25),
+    )
 
     sample_count = 0
     for doc in docs:
         sample_count += 1
+
+        tag_confidences = doc.get("tag_confidences", {}) or {}
+        if not isinstance(tag_confidences, dict):
+            tag_confidences = {}
 
         for dim in _SCORE_DIMENSIONS:
             key = f"{dim}Score" if dim in {"aesthetic", "technical"} else dim
@@ -123,7 +148,32 @@ def _build_profile_from_docs(docs: Iterable[dict]) -> Dict[str, object]:
             normalized_tag = _normalize_tag(tag)
             if not normalized_tag or normalized_tag == "photo":
                 continue
+
+            confidence_value = None
+            if normalized_tag in tag_confidences:
+                confidence_value = tag_confidences.get(normalized_tag)
+            elif tag in tag_confidences:
+                confidence_value = tag_confidences.get(tag)
+
+            confidence = None
+            if confidence_value is not None:
+                try:
+                    confidence = float(confidence_value)
+                except (TypeError, ValueError):
+                    confidence = None
+
+            min_required = sensitive_tag_min_confidence if normalized_tag in _SENSITIVE_TAGS else base_tag_min_confidence
+
+            if confidence is not None and confidence < min_required:
+                continue
+
+            if confidence is None and require_confidence:
+                continue
+
             tag_counter[normalized_tag] += 1
+            confidence_weight = confidence if confidence is not None else base_tag_min_confidence
+            confidence_weight = max(0.05, min(1.0, float(confidence_weight)))
+            tag_weight_counter[normalized_tag] = float(tag_weight_counter.get(normalized_tag, 0.0)) + confidence_weight
 
         for suggestion in doc.get("suggestions", []) or []:
             if not isinstance(suggestion, str):
@@ -150,14 +200,20 @@ def _build_profile_from_docs(docs: Iterable[dict]) -> Dict[str, object]:
             "q90": round(_quantile(ordered, 0.90), 4),
         }
 
-    total_tags = sum(tag_counter.values())
+    filtered_weights: Dict[str, float] = {}
+    for tag, count in tag_counter.items():
+        if int(count) < min_prior_occurrences:
+            continue
+        filtered_weights[tag] = float(tag_weight_counter.get(tag, float(count)))
+
+    total_weight = sum(filtered_weights.values())
     tag_priors: Dict[str, float] = {}
-    if total_tags > 0:
-        for tag, count in tag_counter.items():
-            tag_priors[tag] = float(count) / float(total_tags)
+    if total_weight > 0.0:
+        for tag, weighted_count in filtered_weights.items():
+            tag_priors[tag] = float(weighted_count) / float(total_weight)
 
     max_dynamic = max(10, min(_env_int("ADAPTIVE_MAX_DYNAMIC_TAG_LABELS", 80), 400))
-    dynamic_labels = [tag for tag, _ in tag_counter.most_common(max_dynamic)]
+    dynamic_labels = [tag for tag, count in tag_counter.most_common(max_dynamic) if int(count) >= min_dynamic_occurrences]
 
     max_suggestions = max(20, min(_env_int("ADAPTIVE_MAX_SUGGESTION_POOL", 240), 1000))
     suggestion_pool = []
@@ -178,10 +234,11 @@ def _build_profile_from_docs(docs: Iterable[dict]) -> Dict[str, object]:
         "tag_priors": tag_priors,
         "dynamic_labels": dynamic_labels,
         "suggestion_pool": suggestion_pool,
+        "adaptive_epoch": int(adaptive_epoch),
     }
 
 
-def get_adaptive_profile() -> Dict[str, object]:
+def get_adaptive_profile(force_refresh: bool = False) -> Dict[str, object]:
     """Return cached adaptive profile built from previous analysis records."""
     if not _env_bool("ADAPTIVE_PROFILE_ENABLED", True):
         return _default_profile()
@@ -192,10 +249,12 @@ def get_adaptive_profile() -> Dict[str, object]:
     with _PROFILE_CACHE_LOCK:
         cached = _PROFILE_CACHE.get("value")
         expires_at = float(_PROFILE_CACHE.get("expires_at", 0.0) or 0.0)
-        if isinstance(cached, dict) and now < expires_at:
+        if not force_refresh and isinstance(cached, dict) and now < expires_at:
             return cached
 
     max_docs = max(50, min(_env_int("ADAPTIVE_PROFILE_MAX_DOCS", 500), 5000))
+    adaptive_epoch = max(1, _env_int("ADAPTIVE_PROFILE_EPOCH", 2))
+    include_legacy_docs = _env_bool("ADAPTIVE_INCLUDE_LEGACY_DOCS", False)
     projection = {
         "aestheticScore": 1,
         "technicalScore": 1,
@@ -203,12 +262,15 @@ def get_adaptive_profile() -> Dict[str, object]:
         "lighting": 1,
         "color": 1,
         "tags": 1,
+        "tag_confidences": 1,
         "suggestions": 1,
+        "adaptive_epoch": 1,
     }
+    query = {} if include_legacy_docs else {"adaptive_epoch": {"$gte": adaptive_epoch}}
 
     try:
-        docs = list(photos_collection.find({}, projection).sort("_id", -1).limit(max_docs))
-        profile = _build_profile_from_docs(docs)
+        docs = list(photos_collection.find(query, projection).sort("_id", -1).limit(max_docs))
+        profile = _build_profile_from_docs(docs, adaptive_epoch=adaptive_epoch)
     except Exception:
         profile = _default_profile()
 
@@ -245,7 +307,11 @@ def expand_candidate_labels(base_labels: Iterable[str], profile: Dict[str, objec
     return merged[:max_total]
 
 
-def rerank_tags_with_profile(tags: List[str], profile: Dict[str, object]) -> List[str]:
+def rerank_tags_with_profile(
+    tags: List[str],
+    profile: Dict[str, object],
+    tag_confidences: Dict[str, float] | None = None,
+) -> List[str]:
     """Rerank tags by user-history priors while preserving stability and uniqueness."""
     if not tags:
         return []
@@ -255,6 +321,20 @@ def rerank_tags_with_profile(tags: List[str], profile: Dict[str, object]) -> Lis
         return tags
 
     prior_weight = max(0.0, min(_env_float("ADAPTIVE_TAG_PRIOR_WEIGHT", 0.35), 1.0))
+    confidence_weight = max(0.0, min(_env_float("ADAPTIVE_TAG_CONFIDENCE_WEIGHT", 0.70), 1.0))
+    order_weight = max(0.0, min(1.0 - (prior_weight + confidence_weight), 0.60))
+
+    normalized_conf: Dict[str, float] = {}
+    if isinstance(tag_confidences, dict):
+        for raw_tag, raw_score in tag_confidences.items():
+            normalized = _normalize_tag(str(raw_tag))
+            if not normalized:
+                continue
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            normalized_conf[normalized] = max(0.0, min(1.0, score))
 
     head = []
     body = tags
@@ -266,7 +346,9 @@ def rerank_tags_with_profile(tags: List[str], profile: Dict[str, object]) -> Lis
     for idx, tag in enumerate(body):
         normalized = _normalize_tag(tag)
         prior = float(priors.get(normalized, 0.0))
-        score = (1.0 - prior_weight) * 1.0 + (prior_weight * prior)
+        confidence = float(normalized_conf.get(normalized, max(0.05, 1.0 - (0.08 * idx))))
+        order_hint = max(0.0, 1.0 - (0.10 * idx))
+        score = (confidence_weight * confidence) + (prior_weight * prior) + (order_weight * order_hint)
         scored.append((score, -idx, tag))
 
     scored.sort(reverse=True)

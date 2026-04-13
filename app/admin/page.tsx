@@ -30,10 +30,15 @@ type AdaptiveDebugProfile = {
   topSuggestions: TopSuggestion[]
   adaptiveConfig: {
     enabled: boolean
+    profileEpoch?: number
+    includeLegacyDocs?: boolean
     maxDocs: number
     cacheTtlSeconds: number
     maxDynamicTagLabels: number
     maxSuggestionPool: number
+    tagMinOccurrences?: number
+    dynamicTagMinOccurrences?: number
+    runtimeModelVersion?: string
   }
   generatedAt: string
 }
@@ -71,7 +76,8 @@ export default function AdminDebugPage() {
 
     try {
       setError(null)
-      const response = await fetch("/api/admin/profile", { cache: "no-store" })
+      const endpoint = refresh ? "/api/admin/profile?refresh=1" : "/api/admin/profile"
+      const response = await fetch(endpoint, { cache: "no-store" })
       const payload = await readJsonSafe(response)
 
       if (response.status === 401) {

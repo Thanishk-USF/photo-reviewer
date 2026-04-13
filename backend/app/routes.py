@@ -8,7 +8,7 @@ import hashlib
 import hmac
 from datetime import datetime
 from werkzeug.utils import secure_filename
-from app.models.runtime import analyze_image_runtime
+from app.models.runtime import analyze_image_runtime, get_runtime_model_version
 from app.services.analysis_contract import normalize_analysis_result
 
 # Create a blueprint for the API routes
@@ -105,24 +105,55 @@ def analyze_image():
         image_hash = hashlib.sha256(image_bytes).hexdigest()
         file.stream.seek(0)
 
+        force_reanalyze_value = str(request.form.get('forceReanalyze', '')).strip().lower()
+        force_reanalyze = force_reanalyze_value in {'1', 'true', 'yes', 'on'}
+
+        overwrite_existing = False
+        existing_record = None
+
         # Return existing analysis for duplicate uploads of the same image content.
         from app.services.mongo_service import get_photo_by_image_hash, convert_objectid_to_str
         existing = get_photo_by_image_hash(image_hash)
         if existing:
-            existing = convert_objectid_to_str(existing)
-            if 'image_binary' in existing:
-                del existing['image_binary']
-            if 'image_hash' in existing:
-                del existing['image_hash']
-            if 'id' not in existing and '_id' in existing:
-                existing['id'] = existing['_id']
-            existing['success'] = True
-            existing = normalize_analysis_result(existing)
-            return jsonify(existing)
+            current_model_version = get_runtime_model_version(current_app.config)
+            current_epoch = int(current_app.config.get('ADAPTIVE_PROFILE_EPOCH', 2) or 2)
+            existing_model_version = str(existing.get('model_version', '') or '').strip()
+            try:
+                existing_epoch = int(existing.get('adaptive_epoch', 0) or 0)
+            except (TypeError, ValueError):
+                existing_epoch = 0
 
-        # Generate a unique ID for this analysis
+            stale_existing = (
+                force_reanalyze
+                or existing_model_version != current_model_version
+                or existing_epoch < current_epoch
+            )
+
+            if stale_existing:
+                overwrite_existing = True
+                existing_record = existing
+            else:
+                existing = convert_objectid_to_str(existing)
+                if 'image_binary' in existing:
+                    del existing['image_binary']
+                if 'image_hash' in existing:
+                    del existing['image_hash']
+                if 'id' not in existing and '_id' in existing:
+                    existing['id'] = existing['_id']
+                existing['success'] = True
+                existing = normalize_analysis_result(existing)
+                return jsonify(existing)
+
+        # Generate a unique ID for this analysis.
+        # When refreshing a stale duplicate, keep the same public ID for stable links.
         analysis_id = str(uuid.uuid4())
-        
+        if existing_record:
+            existing_public_id = existing_record.get('id')
+            if isinstance(existing_public_id, str) and existing_public_id.strip():
+                analysis_id = existing_public_id.strip()
+            elif existing_record.get('_id') is not None:
+                analysis_id = str(existing_record.get('_id'))
+
         # Save the uploaded file
         file_path = os.path.join(ORIGINALS_FOLDER, f"{analysis_id}_{filename}")
         file.save(file_path)
@@ -167,14 +198,22 @@ def analyze_image():
         mongo_payload = {
             **result,
             'image_hash': image_hash,
-            'model_version': runtime_meta.get('model_version', 'pretrained-v2'),
+            'model_version': runtime_meta.get('model_version', get_runtime_model_version(current_app.config)),
             'score_source': runtime_meta.get('scorer_source', 'pretrained'),
+            'aesthetic_source': runtime_meta.get('aesthetic_source', 'clip-only'),
             'tagger_source': runtime_meta.get('tagger_source', 'pretrained'),
             'style_source': runtime_meta.get('style_source', 'pretrained'),
             'suggestion_source': runtime_meta.get('suggestion_source', 'pretrained'),
+            'tag_confidences': runtime_meta.get('tag_confidences', {}),
+            'inference_devices': runtime_meta.get('inference_devices', {}),
+            'device_policy': runtime_meta.get('device_policy', {}),
+            'adaptive_epoch': int(current_app.config.get('ADAPTIVE_PROFILE_EPOCH', 2) or 2),
             'fallback_used': bool(runtime_meta.get('fallback_used', False)),
         }
-        save_analysis(mongo_payload)
+        save_analysis(mongo_payload, overwrite_existing=overwrite_existing)
+
+        from app.services.adaptive_learning import invalidate_adaptive_profile_cache
+        invalidate_adaptive_profile_cache()
         
         # Before returning the result
         print("Analysis complete, returning result")
@@ -283,6 +322,9 @@ def delete_photo(photo_id):
         
         if not success:
             return jsonify({'success': False, 'error': 'Photo not found'}), 404
+
+        from app.services.adaptive_learning import invalidate_adaptive_profile_cache
+        invalidate_adaptive_profile_cache()
         
         return jsonify({'success': True})
     
@@ -301,7 +343,10 @@ def get_admin_adaptive_profile():
 
     from app.services.adaptive_learning import get_adaptive_profile
 
-    profile = get_adaptive_profile() or {}
+    refresh_value = str(request.args.get('refresh', '')).strip().lower()
+    force_refresh = refresh_value in {'1', 'true', 'yes', 'on'}
+
+    profile = get_adaptive_profile(force_refresh=force_refresh) or {}
 
     score_means = profile.get('score_means', {}) or {}
     score_quantiles = profile.get('score_quantiles', {}) or {}
@@ -359,15 +404,55 @@ def get_admin_adaptive_profile():
             'topSuggestions': top_suggestions,
             'adaptiveConfig': {
                 'enabled': bool(current_app.config.get('ADAPTIVE_PROFILE_ENABLED', True)),
+                'profileEpoch': int(current_app.config.get('ADAPTIVE_PROFILE_EPOCH', 2) or 2),
+                'includeLegacyDocs': bool(current_app.config.get('ADAPTIVE_INCLUDE_LEGACY_DOCS', False)),
                 'maxDocs': int(current_app.config.get('ADAPTIVE_PROFILE_MAX_DOCS', 500) or 500),
                 'cacheTtlSeconds': int(current_app.config.get('ADAPTIVE_PROFILE_CACHE_TTL_SECONDS', 300) or 300),
                 'maxDynamicTagLabels': int(current_app.config.get('ADAPTIVE_MAX_DYNAMIC_TAG_LABELS', 80) or 80),
                 'maxSuggestionPool': int(current_app.config.get('ADAPTIVE_MAX_SUGGESTION_POOL', 240) or 240),
+                'tagMinOccurrences': int(current_app.config.get('ADAPTIVE_TAG_MIN_OCCURRENCES', 2) or 2),
+                'dynamicTagMinOccurrences': int(current_app.config.get('ADAPTIVE_DYNAMIC_TAG_MIN_OCCURRENCES', 3) or 3),
+                'pretrainedDeviceMode': str(current_app.config.get('PRETRAINED_DEVICE_MODE', 'auto') or 'auto'),
+                'pretrainedDeviceLegacy': str(current_app.config.get('PRETRAINED_DEVICE', 'cpu') or 'cpu'),
+                'pretrainedCudaIndex': int(current_app.config.get('PRETRAINED_CUDA_INDEX', 0) or 0),
+                'runtimeModelVersion': str(current_app.config.get('MODEL_RUNTIME_VERSION', 'pretrained-v3') or 'pretrained-v3'),
+                'taggerUseSegmentSplit': bool(current_app.config.get('PRETRAINED_TAGGER_USE_SEGMENT_SPLIT', True)),
+                'taggerSegmentModelId': str(current_app.config.get('PRETRAINED_TAGGER_SEGMENT_MODEL_ID', '') or ''),
+                'taggerSegmentMinScore': float(current_app.config.get('PRETRAINED_TAGGER_SEGMENT_MIN_SCORE', 0.15) or 0.15),
+                'taggerSplitFullWeight': float(current_app.config.get('PRETRAINED_TAGGER_SPLIT_FULL_WEIGHT', 0.35) or 0.35),
+                'taggerSplitForegroundWeight': float(current_app.config.get('PRETRAINED_TAGGER_SPLIT_FOREGROUND_WEIGHT', 0.45) or 0.45),
+                'taggerSplitBackgroundWeight': float(current_app.config.get('PRETRAINED_TAGGER_SPLIT_BACKGROUND_WEIGHT', 0.20) or 0.20),
+                'useNimaAesthetic': bool(current_app.config.get('USE_NIMA_AESTHETIC', False)),
+                'nimaModelId': str(current_app.config.get('NIMA_MODEL_ID', '') or ''),
+                'nimaBlendWeight': float(current_app.config.get('NIMA_AESTHETIC_BLEND_WEIGHT', 0.65) or 0.65),
+                'warmupOnStartup': bool(current_app.config.get('PRETRAINED_WARMUP_ON_STARTUP', True)),
+                'warmupRunInference': bool(current_app.config.get('PRETRAINED_WARMUP_RUN_INFERENCE', False)),
+                'warmupFailFast': bool(current_app.config.get('PRETRAINED_WARMUP_FAIL_FAST', False)),
             },
+            'lastWarmupSummary': current_app.config.get('MODEL_WARMUP_SUMMARY', {}),
             'generatedAt': datetime.utcnow().isoformat() + 'Z',
         },
     }
     return jsonify(payload)
+
+
+@api.route('/admin/warmup', methods=['POST'])
+def run_admin_model_warmup():
+    """Trigger protected model warmup for diagnostics and preloading."""
+    if not _admin_debug_expected_key():
+        return jsonify({'success': False, 'error': 'ADMIN_DEBUG_KEY is not configured'}), 503
+
+    if not _is_admin_debug_authorized(request):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    payload = request.get_json(silent=True) or {}
+    run_inference = bool(payload.get('runInference', False))
+
+    from app.services.model_warmup import warmup_models
+
+    summary = warmup_models(current_app.config, run_inference=run_inference)
+    status_code = 200 if summary.get('ok') else 500
+    return jsonify({'success': bool(summary.get('ok')), 'warmup': summary}), status_code
 
 @api.route('/images/<filename>', methods=['GET'])
 def get_image(filename):

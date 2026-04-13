@@ -8,11 +8,15 @@ import math
 import os
 from typing import Dict, List, Sequence, Tuple
 
+from app.models import nima_scorer
 from app.services.adaptive_learning import calibrate_score_from_profile, get_adaptive_profile
+from app.services.device_policy import build_transformers_pipeline
 
 _CLASSIFIER_PIPELINE = None
 _PIPELINE_INIT_FAILED = False
 _LAST_BACKEND = "pretrained-uninitialized"
+_ACTIVE_DEVICE = "uninitialized"
+_LAST_AESTHETIC_SOURCE = "clip-only"
 
 _PROMPT_ENSEMBLE: Dict[str, Dict[str, Sequence[str]]] = {
     "aesthetic": {
@@ -86,23 +90,8 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
-def _parse_device_index(device_value: str) -> int:
-    value = (device_value or "cpu").strip().lower()
-    if value in {"cpu", "-1"}:
-        return -1
-    if value.isdigit():
-        return int(value)
-    if value.startswith("cuda"):
-        if ":" in value:
-            _, _, suffix = value.partition(":")
-            if suffix.isdigit():
-                return int(suffix)
-        return 0
-    return -1
-
-
 def _get_classifier_pipeline():
-    global _CLASSIFIER_PIPELINE, _PIPELINE_INIT_FAILED
+    global _CLASSIFIER_PIPELINE, _PIPELINE_INIT_FAILED, _ACTIVE_DEVICE
 
     if _CLASSIFIER_PIPELINE is not None:
         return _CLASSIFIER_PIPELINE
@@ -110,15 +99,11 @@ def _get_classifier_pipeline():
         return None
 
     model_id = os.environ.get("PRETRAINED_SCORER_MODEL_ID", "openai/clip-vit-base-patch32")
-    device_name = os.environ.get("PRETRAINED_DEVICE", "cpu")
 
     try:
-        from transformers import pipeline
-
-        _CLASSIFIER_PIPELINE = pipeline(
+        _CLASSIFIER_PIPELINE, _ACTIVE_DEVICE = build_transformers_pipeline(
             "zero-shot-image-classification",
-            model=model_id,
-            device=_parse_device_index(device_name),
+            model_id,
         )
     except Exception:
         _PIPELINE_INIT_FAILED = True
@@ -182,6 +167,24 @@ def get_last_backend() -> str:
     return _LAST_BACKEND
 
 
+def get_active_device() -> str:
+    return _ACTIVE_DEVICE
+
+
+def get_last_aesthetic_source() -> str:
+    return _LAST_AESTHETIC_SOURCE
+
+
+def warmup():
+    if _get_classifier_pipeline() is None:
+        raise RuntimeError("Pretrained scorer pipeline could not be initialized")
+
+    if str(os.environ.get("USE_NIMA_AESTHETIC", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        nima_scorer.warmup()
+
+    return True
+
+
 def score_image(image):
     """
     Score an image using pretrained zero-shot classification outputs only.
@@ -189,7 +192,7 @@ def score_image(image):
     Returns:
         Tuple of (aesthetic, technical, composition, lighting, color)
     """
-    global _LAST_BACKEND
+    global _LAST_BACKEND, _LAST_AESTHETIC_SOURCE
 
     classifier = _get_classifier_pipeline()
     if classifier is None:
@@ -211,7 +214,21 @@ def score_image(image):
 
         # Keep overall score coherent with model-derived subdimensions.
         sub_mean = (outputs["technical"] + outputs["composition"] + outputs["lighting"] + outputs["color"]) / 4.0
-        outputs["aesthetic"] = _clamp_score((outputs["aesthetic"] * 0.65) + (sub_mean * 0.35))
+        clip_aesthetic = _clamp_score((outputs["aesthetic"] * 0.65) + (sub_mean * 0.35))
+
+        blended_aesthetic = clip_aesthetic
+        _LAST_AESTHETIC_SOURCE = "clip-only"
+        if str(os.environ.get("USE_NIMA_AESTHETIC", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                nima_aesthetic = nima_scorer.score_aesthetic(image)
+                nima_weight = max(0.0, min(_env_float("NIMA_AESTHETIC_BLEND_WEIGHT", 0.65), 1.0))
+                blended_aesthetic = _clamp_score((clip_aesthetic * (1.0 - nima_weight)) + (nima_aesthetic * nima_weight))
+                _LAST_AESTHETIC_SOURCE = "clip+nima"
+            except Exception:
+                blended_aesthetic = clip_aesthetic
+                _LAST_AESTHETIC_SOURCE = "clip-fallback"
+
+        outputs["aesthetic"] = blended_aesthetic
 
         # Re-center with historical user distribution when enough records exist.
         for dimension in ("aesthetic", "technical", "composition", "lighting", "color"):

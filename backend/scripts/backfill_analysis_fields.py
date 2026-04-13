@@ -22,10 +22,15 @@ from typing import Dict, Optional, Tuple
 
 from PIL import Image
 from pymongo import MongoClient
+from dotenv import load_dotenv
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
 if BACKEND_ROOT not in sys.path:
     sys.path.insert(0, BACKEND_ROOT)
+
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env.local"), override=False)
 
 from app.models.runtime import analyze_image_runtime
 from app.services.analysis_contract import normalize_analysis_result
@@ -130,9 +135,13 @@ def backfill_document(doc: dict, image_bytes: bytes, model_version: Optional[str
         "image_hash": hashlib.sha256(image_bytes).hexdigest(),
         "model_version": (str(model_version).strip() if model_version is not None else "") or str(runtime_meta.get("model_version", "pretrained-v2")),
         "score_source": str(runtime_meta.get("scorer_source", "pretrained")),
+        "aesthetic_source": str(runtime_meta.get("aesthetic_source", "clip-only")),
         "tagger_source": str(runtime_meta.get("tagger_source", "pretrained")),
         "style_source": str(runtime_meta.get("style_source", "pretrained")),
         "suggestion_source": str(runtime_meta.get("suggestion_source", "pretrained")),
+        "tag_confidences": runtime_meta.get("tag_confidences", {}) or {},
+        "inference_devices": runtime_meta.get("inference_devices", {}) or {},
+        "device_policy": runtime_meta.get("device_policy", {}) or {},
         "fallback_used": bool(runtime_meta.get("fallback_used", False)),
     }
 

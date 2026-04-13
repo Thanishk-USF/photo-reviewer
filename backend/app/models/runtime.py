@@ -5,12 +5,14 @@ This module keeps model selection and fallback logic in one place.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Tuple
 
 from app.models import scorer as model_scorer
 from app.models import style as model_style
 from app.models import suggester as model_suggester
 from app.models import tagger as model_tagger
+from app.services.device_policy import get_device_policy_snapshot
 
 
 def _clamp_score(value: Any, default: float = 5.5) -> float:
@@ -81,6 +83,13 @@ def _require_pretrained_enabled(app_config: Dict[str, Any], flag_name: str) -> N
     raise RuntimeError(f"{flag_name} must be enabled for pretrained-only analysis")
 
 
+def get_runtime_model_version(app_config: Dict[str, Any]) -> str:
+    configured = str(app_config.get("MODEL_RUNTIME_VERSION") or os.environ.get("MODEL_RUNTIME_VERSION") or "").strip()
+    if configured:
+        return configured
+    return "pretrained-v3"
+
+
 def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze image with pretrained model outputs only (no deterministic fallback)."""
     _require_pretrained_enabled(app_config, "USE_PRETRAINED_SCORER")
@@ -90,10 +99,14 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
 
     aesthetic, technical, composition, lighting, color = _ensure_score_tuple(model_scorer.score_image(image))
     scorer_source = getattr(model_scorer, "get_last_backend", lambda: "pretrained")()
+    aesthetic_source = getattr(model_scorer, "get_last_aesthetic_source", lambda: "clip-only")()
+    scorer_device = getattr(model_scorer, "get_active_device", lambda: "unknown")()
 
     final_tags = _coerce_tags(model_tagger.generate_tags(image))
+    tag_confidences = getattr(model_tagger, "get_last_tag_confidences", lambda: {})() or {}
     final_hashtags = _tags_to_hashtags(final_tags)
     tagger_source = getattr(model_tagger, "get_last_backend", lambda: "pretrained")()
+    tagger_device = getattr(model_tagger, "get_active_device", lambda: "unknown")()
 
     final_style, final_mood = model_style.classify_style(image)
     if not isinstance(final_style, str) or not final_style.strip() or not isinstance(final_mood, str) or not final_mood.strip():
@@ -101,6 +114,7 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
     final_style = final_style.strip()
     final_mood = final_mood.strip()
     style_source = getattr(model_style, "get_last_backend", lambda: "pretrained")()
+    style_device = getattr(model_style, "get_active_device", lambda: "unknown")()
 
     model_suggestions = model_suggester.generate_suggestions(
         image,
@@ -116,9 +130,12 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
     if not final_suggestions:
         raise RuntimeError("Pretrained suggester returned no usable suggestions")
     suggestion_source = getattr(model_suggester, "get_last_backend", lambda: "pretrained")()
+    suggester_device = getattr(model_suggester, "get_active_device", lambda: "unknown")()
 
     if not all(source == "pretrained" for source in (scorer_source, tagger_source, style_source, suggestion_source)):
         raise RuntimeError("Non-pretrained backend detected in pretrained-only mode")
+
+    model_version = get_runtime_model_version(app_config)
 
     return {
         "aestheticScore": aesthetic,
@@ -132,11 +149,20 @@ def analyze_image_runtime(image, filename: str, app_config: Dict[str, Any]) -> D
         "hashtags": final_hashtags,
         "suggestions": final_suggestions,
         "_runtime": {
-            "model_version": "pretrained-v2",
+            "model_version": model_version,
             "scorer_source": scorer_source,
+            "aesthetic_source": aesthetic_source,
             "tagger_source": tagger_source,
             "style_source": style_source,
             "suggestion_source": suggestion_source,
+            "tag_confidences": tag_confidences,
+            "inference_devices": {
+                "scorer": scorer_device,
+                "tagger": tagger_device,
+                "style": style_device,
+                "suggester": suggester_device,
+            },
+            "device_policy": get_device_policy_snapshot(),
             "fallback_used": False,
         },
     }

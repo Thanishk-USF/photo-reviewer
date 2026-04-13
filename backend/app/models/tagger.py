@@ -122,6 +122,7 @@ _CAPTION_PHRASE_TAGS = {
     "monochrome": "monochrome",
 }
 
+
 _SENSITIVE_TAGS = {"moon", "astronomy"}
 _CAPTION_DIRECT_ALLOWLIST = {
     "flower",
